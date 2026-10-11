@@ -74,7 +74,10 @@ function setup(batches: SplitItem[][], delay: (c: KittyCommand) => number, tail:
 
 const chunk = new Uint8Array(0)
 
-describe('pipeline', () => {
+// Both suites run their tests concurrently: every test builds its own pipeline,
+// splitter, engine and output arrays; the shared constants (emitter, empty
+// chunk, placeholder strings) are never mutated.
+describe('pipeline', { concurrency: true }, () => {
   it('writes text through synchronously when nothing is pending', async () => {
     const t = setup([[text('hello '), text('world')]], () => 0)
     const done = t.pipeline.feed(chunk)
@@ -208,7 +211,7 @@ describe('pipeline', () => {
   })
 })
 
-describe('pipeline: unicode placeholders', () => {
+describe('pipeline: unicode placeholders', { concurrency: true }, () => {
   const PH = '\u{10EEEE}'
   // Row 0, columns 0 and 1 (U+0305 is 0, U+030D is 1 in kitty's diacritic table).
   const cells = `\x1b[38;5;42m${PH}\u{305}\u{305}${PH}\u{305}\u{30D}\x1b[0m`
@@ -298,7 +301,7 @@ describe('pipeline: unicode placeholders', () => {
     await t.pipeline.feed(chunk)
     await t.pipeline.feed(chunk)
     assert.equal(t.out.join(''), '\x1b[38;5;42m')
-    await sleep(80) // default 25 ms
+    await sleep(150) // default 25 ms; generous, these tests run concurrently
     const all = t.out.join('')
     assert.ok(all.startsWith('\x1b[38;5;42m\x1b7  \x1b8\x1bP'), JSON.stringify(all.slice(0, 40)))
     assert.ok(!all.includes(PH))
@@ -308,12 +311,13 @@ describe('pipeline: unicode placeholders', () => {
   })
 
   it('a chunk arriving before the idle timer cancels it; the run continues as one strip', async () => {
-    const t = run([[virtualApc], [text(open)], [text(`${PH}\u{305}\u{30E}<x>`)]], [], 40)
+    // The idle delay is long against the 15 ms gap, so a busy event loop cannot let it fire first.
+    const t = run([[virtualApc], [text(open)], [text(`${PH}\u{305}\u{30E}<x>`)]], [], 250)
     await t.pipeline.feed(chunk)
     await t.pipeline.feed(chunk)
     await sleep(15)
     await t.pipeline.feed(chunk)
-    await sleep(80)
+    await sleep(300) // past the idle delay: an uncancelled timer would have fired by now
     const all = t.out.join('')
     assert.equal(all.match(/\x1b7/g)?.length, 1, 'one strip, not a flushed one plus another')
     assert.ok(all.includes('\x1b8\x1b[3C<x>'))
@@ -321,7 +325,8 @@ describe('pipeline: unicode placeholders', () => {
   })
 
   it('a held run is written before a later APC, and idle flushes keep byte order around slow APCs', async () => {
-    const t = run([[virtualApc], [text(`<a>${open}`), placeApc(40), text(`<b>${open}`)]], [], 10)
+    // A 300 ms APC, so it is surely still in flight at the 20 ms look even on a busy event loop.
+    const t = run([[virtualApc], [text(`<a>${open}`), placeApc(300), text(`<b>${open}`)]], [], 10)
     await t.pipeline.feed(chunk)
     const done = t.pipeline.feed(chunk)
     await sleep(20) // the APC is in flight; the run before it is already out
@@ -329,7 +334,7 @@ describe('pipeline: unicode placeholders', () => {
     assert.equal(early.match(/\x1bP/g)?.length, 1, JSON.stringify(early))
     assert.ok(!early.includes('[IMG1'))
     await done
-    await sleep(40) // the second run is held after the APC, then flushed when idle
+    await sleep(100) // the second run is held after the APC, then flushed when idle (10 ms)
     const all = t.out.join('')
     const order = ['<a>', '\x1bP', '[IMG1', '<b>'].map((m) => all.indexOf(m))
     assert.deepEqual([...order].sort((x, y) => x - y), order, JSON.stringify(all))

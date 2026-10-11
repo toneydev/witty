@@ -29,12 +29,32 @@ function sixelOptionsOf(opts: EmitOptions): SixelOptions {
   return sixel
 }
 
-/** The pixel box of `columns` × `rows` cells (each side at least 1 pixel). */
+/** Largest side of any scaled image, in pixels. */
+export const MAX_BOX_SIDE = 8192
+/** Largest area of any scaled image, in pixels (64 MiB of RGBA). */
+export const MAX_BOX_PIXELS = 16_777_216
+
+/**
+ * The pixel box of `columns` × `rows` cells: `round(columns * cw)` ×
+ * `round(rows * ch)` (each side at least 1), and the cell size to cut it by.
+ * A box over {@link MAX_BOX_SIDE} on a side or {@link MAX_BOX_PIXELS} in area
+ * is scaled down proportionally (the image then draws smaller than its
+ * cells), and `cell` is shrunk to match so strips still tile it exactly.
+ */
+export function placementGeometry(columns: number, rows: number, cell: CellSize): { width: number; height: number; cell: CellSize } {
+  const width = Math.max(1, Math.round(columns * cell.width))
+  const height = Math.max(1, Math.round(rows * cell.height))
+  if (width <= MAX_BOX_SIDE && height <= MAX_BOX_SIDE && width * height <= MAX_BOX_PIXELS) return { width, height, cell }
+  const f = Math.min(MAX_BOX_SIDE / width, MAX_BOX_SIDE / height, Math.sqrt(MAX_BOX_PIXELS / (width * height)))
+  const w = Math.max(1, Math.floor(width * f))
+  const h = Math.max(1, Math.floor(height * f))
+  return { width: w, height: h, cell: { width: w / Math.max(1, columns), height: h / Math.max(1, rows) } }
+}
+
+/** The (capped) pixel box of `columns` × `rows` cells, see {@link placementGeometry}. */
 export function placementBox(columns: number, rows: number, cell: CellSize): { width: number; height: number } {
-  return {
-    width: Math.max(1, Math.round(columns * cell.width)),
-    height: Math.max(1, Math.round(rows * cell.height)),
-  }
+  const { width, height } = placementGeometry(columns, rows, cell)
+  return { width, height }
 }
 
 /** `image` scaled to fill `columns` × `rows` cells exactly with `mode` (itself when it already fits). */

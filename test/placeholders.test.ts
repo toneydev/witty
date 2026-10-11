@@ -177,6 +177,17 @@ describe('placeholder pass', () => {
     assert.equal(found[0]!.image.height + found[1]!.image.height, height)
   })
 
+  it('a huge virtual placement is scaled into the capped box; strips are cut from it', () => {
+    const t = setup(placement(CAPTURE_ID, cellImage(2, 2, 0, 1, 1), 1000, 1000))
+    t.setCell({ width: 10, height: 20 })
+    const found = strips(t.run(`${CAPTURE_SGR}${row(0, 8)}x`))
+    assert.equal(found.length, 1)
+    const strip = found[0]!.image
+    // The capped box is about 2896 x 5792 (not 10000 x 20000): a cell is about 2.9 x 5.8 px.
+    assert.ok(strip.width >= 20 && strip.width <= 26, `${strip.width}`)
+    assert.ok(strip.height >= 5 && strip.height <= 6, `${strip.height}`)
+  })
+
   it('two rows between cursor moves become two strips', () => {
     const image = cellImage(8, 2)
     const t = setup(placement(CAPTURE_ID, image, 8, 2))

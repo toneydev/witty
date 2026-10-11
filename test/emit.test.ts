@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createPlaceEmitter, emitPlacement } from '../src/term/emit.ts'
+import { MAX_BOX_PIXELS, MAX_BOX_SIDE, createPlaceEmitter, emitPlacement, placementGeometry, scaleToBox } from '../src/term/emit.ts'
 import { decodeSixel } from './helpers/sixel-decoder.ts'
 import { make, pixel, solid } from './helpers/images.ts'
 import type { CursorPolicy, EngineEvent, Rgba } from '../src/types.ts'
@@ -95,6 +95,22 @@ test('fractional cells: the box is round(columns * cw) x round(rows * ch)', () =
   const d = decodeSixel(sixel)
   assert.deepEqual([d.image.width, d.image.height], [75, 56]) // 75, round(55.5)
   assert.equal(tail, '\x1b8\x1b[2B\x1b[8C')
+})
+
+test('the scaled pixel box is capped: c=1000,r=1000 at 10x20 stays within 8192 a side and 16M pixels', () => {
+  const cell = { width: 10, height: 20 }
+  const g = placementGeometry(1000, 1000, cell) // uncapped: 10000x20000
+  assert.ok(g.width <= MAX_BOX_SIDE && g.height <= MAX_BOX_SIDE, `${g.width}x${g.height}`)
+  assert.ok(g.width * g.height <= MAX_BOX_PIXELS, `${g.width * g.height}`)
+  assert.ok(Math.abs(g.width / g.height - 0.5) < 0.01, 'scaled down proportionally')
+  assert.equal(Math.round(1000 * g.cell.width), g.width, 'the shrunk cell tiles the box')
+  const scaled = scaleToBox(solid(2, 2, 0, 0, 255), 1000, 1000, cell, 'nearest')
+  assert.deepEqual([scaled.width, scaled.height], [g.width, g.height])
+  assert.ok(scaled.data.length <= MAX_BOX_PIXELS * 4)
+  // One long side alone is capped too, and a box within the cap is untouched.
+  const long = placementGeometry(1000, 1, cell)
+  assert.deepEqual([long.width, long.height], [8192, 16])
+  assert.deepEqual(placementGeometry(80, 24, cell), { width: 800, height: 480, cell })
 })
 
 test('options reach the encoder', () => {

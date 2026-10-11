@@ -1,13 +1,19 @@
 // The kitty graphics interpreter: image store, chunk accumulation, actions, responses.
 
 import type { EngineEvent, KittyCommand, KittyEngine, KittyEngineOptions, Rgba, VirtualPlacementKey } from '../types.ts'
-import { KittyError, encodeResponse, uintKey } from './command.ts'
+import { KittyError, encodeResponse, printable, uintKey } from './command.ts'
 import type { ResponseFields } from './command.ts'
 import { DEFAULT_MAX_IMAGE_BYTES, DEFAULT_MAX_PAYLOAD_BYTES, decodeImage } from './decode.ts'
 import { cropRgba as crop } from '../image/crop.ts'
 
 /** Default bound on stored image data (RGBA bytes) before LRU eviction. */
 export const DEFAULT_MAX_STORE_BYTES = 256 * 1024 * 1024
+
+/** The actions of the protocol (for naming one in a log line). */
+const KNOWN_ACTIONS = new Set(['t', 'T', 'q', 'p', 'd', 'f', 'a', 'c'])
+
+/** Largest placement box side, in cells (given as `c`/`r` or derived from the aspect ratio). */
+export const MAX_PLACEMENT_CELLS = 1024
 
 /** Engine options plus internal knobs (exposed for tests). */
 export type EngineOptions = KittyEngineOptions & {
@@ -149,9 +155,9 @@ export class Engine implements KittyEngine {
         case 'f':
         case 'a':
         case 'c':
-          throw new KittyError('EINVAL', `animation (a=${action}) is not supported`)
+          throw new KittyError('EINVAL', 'animation is not supported')
         default:
-          throw new KittyError('EINVAL', `unknown action a=${action}`)
+          throw new KittyError('EINVAL', 'unknown action')
       }
     } catch (error) {
       if (!(error instanceof KittyError)) throw error
@@ -326,6 +332,9 @@ export class Engine implements KittyEngine {
       columns = Math.ceil(width / cellWidth)
       rows = Math.ceil(height / cellHeight)
     }
+    if (!(columns <= MAX_PLACEMENT_CELLS && rows <= MAX_PLACEMENT_CELLS)) {
+      throw new KittyError('EINVAL', 'placement too large')
+    }
     return { source, columns, rows }
   }
 
@@ -363,6 +372,7 @@ export class Engine implements KittyEngine {
         return
       }
       case 'f':
+        // Known selectors only (one letter from the switch), so safe to name.
         events.push({ kind: 'log', message: `delete d=${selector}: animation frames are not supported` })
         return
       case 'c':
@@ -377,7 +387,7 @@ export class Engine implements KittyEngine {
         })
         return
       default:
-        events.push({ kind: 'log', message: `delete with unknown selector d=${selector} ignored` })
+        events.push({ kind: 'log', message: 'delete with an unknown selector ignored' })
     }
   }
 
@@ -448,7 +458,9 @@ export class Engine implements KittyEngine {
   }
 
   #respondError(events: EngineEvent[], keys: Record<string, string>, error: KittyError): void {
-    events.push({ kind: 'log', message: `kitty a=${keys.a ?? 't'}: ${error.status}` })
+    // Name the action only when it is one witty knows; never echo the child's value.
+    const action = keys.a === undefined || keys.a === '' ? 't' : KNOWN_ACTIONS.has(keys.a) ? keys.a : '?'
+    events.push({ kind: 'log', message: `kitty a=${action}: ${printable(error.status)}` })
     let fields: ResponseFields
     try {
       fields = { i: uintKey(keys, 'i'), I: uintKey(keys, 'I'), p: uintKey(keys, 'p') }

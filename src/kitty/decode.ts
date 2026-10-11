@@ -2,8 +2,12 @@
 
 import { inflateRawSync, inflateSync } from 'node:zlib'
 import { PNG } from 'pngjs'
-import type { Rgba } from '../types.ts'
+import type { FileRange, Rgba } from '../types.ts'
 import { KittyError, uintKey } from './command.ts'
+import { TEMP_FILE_MARKER } from './files.ts'
+
+/** The only status a file transport failure answers (no existence, size or readability detail). */
+export const FILE_READ_FAILED = 'Failed to read image file'
 
 /** Default largest decoded image, in bytes of RGBA. */
 export const DEFAULT_MAX_IMAGE_BYTES = 64 * 1024 * 1024
@@ -12,7 +16,7 @@ export const DEFAULT_MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
 
 export type DecodeOptions = {
   /** Reads a file for `t=f` / `t=t`; absent, those transports are refused with EINVAL. */
-  readFile?: ((path: string) => Promise<Uint8Array>) | undefined
+  readFile?: ((path: string, range: FileRange) => Promise<Uint8Array>) | undefined
   /** Deletes a `t=t` temp file after reading; absent, the file is left in place. */
   deleteFile?: ((path: string) => Promise<void>) | undefined
   /** Largest decoded image, bytes of RGBA. */
@@ -29,10 +33,13 @@ const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
  * pixels (default `f=32`); `o=z` zlib-inflates the data first; `t=d` (the
  * default) means the payload is the base64 data, `t=f` / `t=t` that it is the
  * base64 of a file path, read through `options.readFile` honoring `O`
- * (offset) and `S` (size). A `t=t` file is deleted after reading, but only
- * when its path contains `tty-graphics-protocol`. `t=s` is refused.
+ * (offset) and `S` (size); every file failure is `EBADF:Failed to read image
+ * file`. A `t=t` file is offered to `options.deleteFile` after the read
+ * attempt only when its basename contains `tty-graphics-protocol` (the
+ * deleter applies the rest of the policy, see files.ts). `t=s` is refused.
  *
- * Throws `KittyError` with the response code for every failure.
+ * Throws `KittyError` with the response code for every failure. Messages are
+ * fixed strings: nothing from the command is echoed back.
  */
 export async function decodeImage(
   keys: Record<string, string>,
@@ -43,11 +50,11 @@ export async function decodeImage(
   const maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
   const format = keys.f === undefined || keys.f === '' ? '32' : keys.f
   if (format !== '24' && format !== '32' && format !== '100') {
-    throw new KittyError('EINVAL', `unsupported format f=${format}`)
+    throw new KittyError('EINVAL', 'unsupported format')
   }
   const compression = keys.o ?? ''
   if (compression !== '' && compression !== 'z') {
-    throw new KittyError('EINVAL', `unsupported compression o=${compression}`)
+    throw new KittyError('EINVAL', 'unsupported compression')
   }
 
   let data = await readData(keys, payload, options, maxPayloadBytes, maxImageBytes)
@@ -75,10 +82,16 @@ async function readData(
     case 't':
       return readFileData(medium, keys, payload, options, maxImageBytes)
     case 's':
-      throw new KittyError('EINVAL', 'shared memory transmission (t=s) is not supported')
+      throw new KittyError('EINVAL', 'shared memory transmission is not supported')
     default:
-      throw new KittyError('EINVAL', `unknown transmission medium t=${medium}`)
+      throw new KittyError('EINVAL', 'unsupported transmission medium')
   }
+}
+
+/** The last path component, for either separator. */
+function basenameOf(p: string): string {
+  const parts = p.split(/[\\/]/)
+  return parts[parts.length - 1] ?? ''
 }
 
 async function readFileData(
@@ -90,32 +103,31 @@ async function readFileData(
 ): Promise<Uint8Array> {
   const { readFile, deleteFile } = options
   if (readFile === undefined) {
-    throw new KittyError('EINVAL', `file transmission (t=${medium}) is not supported`)
+    throw new KittyError('EINVAL', 'file transmission is not supported')
   }
   const offset = uintKey(keys, 'O')
   const size = uintKey(keys, 'S')
+  const failed = () => new KittyError('EBADF', FILE_READ_FAILED)
   const path = Buffer.from(payload, 'base64').toString('utf8')
-  if (path === '' || path.includes('\0')) throw new KittyError('EINVAL', 'invalid file path')
+  if (path === '' || path.includes('\0')) throw failed()
 
   let file: Uint8Array
   try {
-    file = await readFile(path)
+    file = await readFile(path, { offset, size, maxBytes: maxImageBytes })
   } catch {
-    throw new KittyError('EBADF', 'Failed to read image file')
+    throw failed()
   } finally {
-    // kitty's safety rule: only files that are clearly graphics temp files are deleted.
-    if (medium === 't' && deleteFile !== undefined && path.includes('tty-graphics-protocol')) {
+    // kitty's safety rule, tightened: only a file clearly named as a graphics
+    // temp file is offered for deletion; the deleter also requires it to be
+    // inside the temp directory.
+    if (medium === 't' && deleteFile !== undefined && basenameOf(path).includes(TEMP_FILE_MARKER)) {
       await deleteFile(path).catch(() => undefined)
     }
   }
-  if (offset > file.length || (size > 0 && offset + size > file.length)) {
-    throw new KittyError('EBADF', 'Failed to read image file')
+  if (file.length > maxImageBytes || offset > file.length || (size > 0 && offset + size > file.length)) {
+    throw failed()
   }
-  const data = file.subarray(offset, size > 0 ? offset + size : file.length)
-  if (data.length > maxImageBytes) {
-    throw new KittyError('EFBIG', `file data of ${data.length} bytes exceeds ${maxImageBytes}`)
-  }
-  return data
+  return file.subarray(offset, size > 0 ? offset + size : file.length)
 }
 
 function base64(text: string): Uint8Array {
@@ -163,8 +175,9 @@ function decodePng(data: Uint8Array, maxImageBytes: number): Rgba {
   let png: { width: number; height: number; data: Buffer }
   try {
     png = PNG.sync.read(Buffer.from(data.buffer, data.byteOffset, data.length))
-  } catch (error) {
-    throw new KittyError('EBADPNG', error instanceof Error ? error.message : String(error))
+  } catch {
+    // pngjs messages can carry chunk names and other bytes from the data.
+    throw new KittyError('EBADPNG', 'invalid PNG')
   }
   const { width, height } = png
   if (png.data.length < width * height * 4) throw new KittyError('EBADPNG', 'truncated PNG image data')

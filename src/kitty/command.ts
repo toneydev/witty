@@ -45,17 +45,33 @@ export function parseKittyCommand(body: string): KittyCommand {
 /** The fields a response may echo back, in kitty's order. */
 export type ResponseFields = { i?: number | undefined; I?: number | undefined; p?: number | undefined }
 
+/** Longest status text a response carries. */
+export const MAX_STATUS_LENGTH = 128
+
+/**
+ * `text` made safe to embed in a response or a log line: every character
+ * outside printable ASCII (0x20-0x7e), and `;` and `\`, becomes `?`, and the
+ * result is cut to `max` characters. Nothing in it can end or extend an
+ * escape sequence on the child's input, or forge a log line.
+ */
+export function printable(text: string, max: number = MAX_STATUS_LENGTH): string {
+  const clean = text.replace(/[^\x20-\x7e]|[;\\]/gu, '?')
+  return clean.length > max ? clean.slice(0, max) : clean
+}
+
 /**
  * Encodes a graphics response for the child's input:
- * `ESC _ G i=1,I=2,p=3;STATUS ESC \`. Absent or zero fields are left out.
+ * `ESC _ G i=1,I=2,p=3;STATUS ESC \`. Absent or zero fields are left out;
+ * the status is sanitised with {@link printable} (it goes to the child's
+ * input, where a stray ESC, CAN or `\` could end or inject sequences).
  */
 export function encodeResponse(fields: ResponseFields, status: string): string {
   const parts: string[] = []
   for (const key of ['i', 'I', 'p'] as const) {
     const value = fields[key]
-    if (value !== undefined && value !== 0) parts.push(`${key}=${value}`)
+    if (value !== undefined && value !== 0 && Number.isInteger(value) && value > 0) parts.push(`${key}=${value}`)
   }
-  return `\x1b_G${parts.join(',')};${status}\x1b\\`
+  return `\x1b_G${parts.join(',')};${printable(status)}\x1b\\`
 }
 
 /**
@@ -65,8 +81,9 @@ export function encodeResponse(fields: ResponseFields, status: string): string {
 export function uintKey(keys: Record<string, string>, name: string, fallback = 0): number {
   const raw = keys[name]
   if (raw === undefined || raw === '') return fallback
-  if (!/^\d{1,10}$/.test(raw)) throw new KittyError('EINVAL', `invalid value for key ${name}: ${raw}`)
+  // `name` is one of witty's own key names; the value is never echoed.
+  if (!/^\d{1,10}$/.test(raw)) throw new KittyError('EINVAL', `invalid value for key ${printable(name, 8)}`)
   const value = Number(raw)
-  if (value > 0xffffffff) throw new KittyError('EINVAL', `value out of range for key ${name}: ${raw}`)
+  if (value > 0xffffffff) throw new KittyError('EINVAL', `value out of range for key ${printable(name, 8)}`)
   return value
 }
