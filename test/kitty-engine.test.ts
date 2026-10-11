@@ -501,3 +501,52 @@ test('evicting an image with virtual placements reports a delete', async () => {
   assert.deepEqual(kinds(events), ['delete'])
   assert.deepEqual(events.find((ev) => ev.kind === 'delete'), { kind: 'delete', imageIds: [1] })
 })
+
+// Hardening against untrusted child output.
+
+test('placement boxes over 1024 cells on a side answer EINVAL, given or derived', async () => {
+  const e = engine()
+  await send(e, `a=t,f=32,s=1,v=1,i=1;${b64(Uint8Array.of(1, 2, 3, 255))}`)
+  for (const keys of ['c=5000', 'r=5000', 'c=1025,r=1', 'c=5000,U=1', 'r=1025,U=1']) {
+    const events = await send(e, `a=p,i=1,${keys}`)
+    assert.deepEqual(kinds(events), ['respond'], keys)
+    assert.equal(responses(events)[0], response('i=1;EINVAL:placement too large'), keys)
+  }
+  assert.deepEqual(kinds(await send(e, 'a=p,i=1,c=1000,r=1000')), ['place', 'respond'])
+  assert.deepEqual(kinds(await send(e, 'a=p,i=1,c=1024,r=1024,U=1')), ['virtual', 'respond'])
+  // Derived from the aspect ratio: 1x4000 pixels at c=1 is 2000 rows of 20 px.
+  await send(e, `a=t,f=32,s=1,v=4000,i=2;${b64(new Uint8Array(4 * 4000))}`)
+  assert.equal(responses(await send(e, 'a=p,i=2,c=1'))[0], response('i=2;EINVAL:placement too large'))
+  // Derived from the size in cells: 20000 px wide is 2000 columns of 10 px.
+  const wide = await send(e, `a=T,f=32,s=20000,v=1,i=3;${b64(new Uint8Array(4 * 20000))}`)
+  assert.equal(responses(wide)[0], response('i=3;EINVAL:placement too large'))
+})
+
+test('attacker-controlled values never reach a response or a message', async () => {
+  const e = engine()
+  const value = 'x\x18\r\n\x7f;\\\x1b'
+  const cases: Array<[Record<string, string>, string]> = [
+    [{ a: 'T', i: '1', f: value }, 'EINVAL:unsupported format'],
+    [{ a: 'T', i: '1', o: value }, 'EINVAL:unsupported compression'],
+    [{ a: 'T', i: '1', t: value }, 'EINVAL:unsupported transmission medium'],
+    [{ a: value, i: '1' }, 'EINVAL:unknown action'],
+    [{ a: 'f', i: '1' }, 'EINVAL:animation is not supported'],
+    [{ a: 'T', i: '1', s: value }, 'EINVAL:invalid value for key s'],
+  ]
+  for (const [keys, status] of cases) {
+    const events = await e.handle({ keys, payload: '' })
+    assert.deepEqual(responses(events), [response(`i=1;${status}`)], JSON.stringify(keys))
+    for (const ev of events) {
+      const text = ev.kind === 'respond' ? ev.data.slice(3, -2) : ev.kind === 'log' ? ev.message : ''
+      assert.ok(!/[\x00-\x1f\x7f]/.test(text), `${ev.kind}: ${JSON.stringify(text)}`)
+      assert.ok(!text.includes('x?'), `${ev.kind} echoes the value: ${JSON.stringify(text)}`)
+    }
+  }
+  // pngjs errors (which can quote chunk bytes) all become one fixed message.
+  const png = pngOf(4, 4, gradient(4, 4))
+  const broken = Uint8Array.from(png)
+  broken[40] = 0xff
+  broken[41] = 0xfe
+  const events = await send(e, `a=T,f=100,i=4;${b64(broken.subarray(0, 60))}`)
+  assert.deepEqual(responses(events), [response('i=4;EBADPNG:invalid PNG')])
+})

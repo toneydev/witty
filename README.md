@@ -19,7 +19,7 @@ ConPTY). Nothing to configure in either terminal.
 
 ```powershell
 cd C:\Repositories\witty
-npm install
+npm ci
 npm run build
 npm link          # puts `witty` on PATH; `npm unlink -g witty` removes it
 ```
@@ -50,6 +50,7 @@ draws pictures with the terminal `Image` element as it would in kitty or Ghostty
 |---|---|
 | `--cell WxH` | cell size in pixels when the terminal does not report it (default 10x20; decimals allowed, e.g. `9.375x20`). witty asks `CSI 14 t` and `CSI 18 t` (exact, fractional) and `CSI 16 t` (rounded) first |
 | `--no-force` | do not set `CLAUDE_CODE_FORCE_TERMINAL_IMAGES` |
+| `--no-files` | refuse the file transports (`t=f`, `t=t`); by default witty reads only absolute local regular files, with a size check, a timeout and no file-system oracle (see SECURITY.md) |
 | `--scale auto\|nearest\|smooth` | how images are scaled to their cells. `auto` (default) uses sharp nearest-neighbour when an image is enlarged 2x or more on both axes (pixel art, icons, sprites) and smooth filtering otherwise; `nearest` and `smooth` force one |
 | `--log <file>` | append diagnostics to a file (`--debug` uses `%TEMP%\witty.log`) |
 | `--help`, `--version` | |
@@ -70,6 +71,11 @@ deletes by screen position. They are accepted and logged.
 
 ```powershell
 npm run typecheck
-npm test                 # 187 tests: protocol, encoder, placeholders, host, and an end-to-end run in a ConPTY
+npm test                 # 206 tests: protocol, encoder, placeholders, host, and an end-to-end run in a ConPTY
 tools\probe-terminal.ps1 # what does this terminal answer to graphics queries?
 ```
+
+## Security
+
+The child's output is treated as untrusted. `SECURITY.md` has the threat model, what witty
+guarantees, and how to report a vulnerability.

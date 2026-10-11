@@ -49,3 +49,19 @@ test('uintKey reads unsigned integers and rejects junk', () => {
     assert.throws(() => uintKey({ i: bad }, 'i'), (error: unknown) => error instanceof KittyError && error.code === 'EINVAL')
   }
 })
+
+test('responses are sanitised: printable ASCII only, no ; or backslash, status capped at 128', () => {
+  const dirty = 'EINVAL:a\x18b\rc\nd\x7fe;f\\g\x1bh\x07i\u{1F600}j\u{E9}'
+  assert.equal(encodeResponse({ i: 1 }, dirty), '\x1b_Gi=1;EINVAL:a?b?c?d?e?f?g?h?i?j?\x1b\\')
+  const long = encodeResponse({ i: 1 }, `EINVAL:${'x'.repeat(500)}`)
+  assert.equal(long.length, '\x1b_Gi=1;'.length + 128 + 2)
+  for (const ch of long.slice('\x1b_Gi=1;'.length, -2)) assert.ok(ch >= ' ' && ch <= '~' && ch !== ';' && ch !== '\\')
+})
+
+test('bad key values are never echoed in the message', () => {
+  const value = 'x\x18\r\n\x7f;'
+  assert.throws(
+    () => uintKey({ s: value }, 's'),
+    (error: unknown) => error instanceof KittyError && !error.message.includes(value) && !/[\x00-\x1f\x7f;]/.test(error.message),
+  )
+})

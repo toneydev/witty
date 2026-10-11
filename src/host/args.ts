@@ -13,6 +13,8 @@ export type CliOptions = {
   logFile: string | undefined
   /** How images are scaled to their cell box. */
   scale: ScaleMode
+  /** Allow the kitty file transports (t=f, t=t) under the file policy. */
+  files: boolean
   /** Set `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` in the child. */
   force: boolean
   help: boolean
@@ -38,6 +40,8 @@ Options:
                  (default 10x20; decimals allowed, e.g. 9.375x20)
   --debug        log to --log <file>, or to %TEMP%\\witty.log
   --log <file>   append log lines to <file> (implies --debug)
+  --no-files     refuse kitty file transmissions (t=f, t=t); by default they
+                 read only regular files on local drive paths
   --no-force     do not set CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1 for the command
   --scale MODE   how images are scaled to their cells: auto (default; sharp
                  nearest-neighbour when enlarged 2x or more, as for pixel art
@@ -53,6 +57,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     debug: false,
     logFile: undefined,
     scale: 'auto',
+    files: true,
     force: true,
     help: false,
     version: false,
@@ -101,6 +106,9 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         options.scale = raw
         break
       }
+      case '--no-files':
+        options.files = false
+        break
       case '--no-force':
         options.force = false
         break

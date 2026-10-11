@@ -116,11 +116,23 @@ export interface PlaceholderPass {
   readonly holding: boolean
 }
 
+/** The part of a transmitted file an image uses: `O` (offset), `S` (size, 0 = to the end), and the size limit. */
+export type FileRange = {
+  offset: number
+  size: number
+  /** Largest file accepted, bytes. */
+  maxBytes: number
+}
+
 export type KittyEngineOptions = {
   /** Pixels per cell, read at each placement (it can be learned late). */
   cellSize: () => CellSize
-  /** Reads a file for `t=f` / `t=t`; absent, those transports are refused with EINVAL. */
-  readFile?: (path: string) => Promise<Uint8Array>
+  /**
+   * Reads a file for `t=f` / `t=t` (the whole file; `range` is what will be
+   * used of it, to be checked before reading). Absent, those transports are
+   * refused with EINVAL. Any rejection becomes `EBADF:Failed to read image file`.
+   */
+  readFile?: (path: string, range: FileRange) => Promise<Uint8Array>
   /** Deletes a `t=t` temp file after reading; absent, the file is left in place. */
   deleteFile?: (path: string) => Promise<void>
   /** Largest decoded image accepted, in bytes of RGBA. Default 64 MiB. */

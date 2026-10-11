@@ -23,6 +23,7 @@ pseudo-console that passes the kitty APC sequences through and translating them 
 | `src/kitty/command.ts` | parse `k=v,k=v;payload` into a typed command |
 | `src/kitty/engine.ts` | the interpreter: image store, chunk accumulation (`m=1`), transmit / put / delete / query, responses |
 | `src/kitty/decode.ts` | payload → RGBA: PNG (`f=100`), raw `f=24`/`f=32`, `o=z` inflate, `t=d` direct, `t=f`/`t=t` file |
+| `src/kitty/files.ts` | the file transport policy: which paths may be read (and `t=t` files deleted), uniform errors, timeout |
 | `src/image/resize.ts` | scale to the target pixel box: nearest-neighbour or smooth (box / bilinear), `auto` picks |
 | `src/sixel/quantize.ts` | median cut to ≤255 colors plus a transparent index |
 | `src/sixel/encode.ts` | RGBA → sixel DCS string |
@@ -119,6 +120,56 @@ or `(fallback)` at startup.
 A command with `q` absent or `0` is answered on the child's input as kitty would:
 `ESC _ G i=<id>[,I=<n>];OK ESC \`, or `EINVAL`/`ENOENT`/`EBADPNG` with a message. `q=1` suppresses
 OK, `q=2` suppresses everything. `a=q` never stores anything.
+
+The status is sanitised before it goes to the child's input: every character outside printable
+ASCII (0x20–0x7e), and `;` and `\`, becomes `?`, and it is cut to 128 characters, so nothing in it
+can end the response or inject a sequence. Messages are fixed strings and never echo the command's
+values (`unsupported format`, `unknown action`, `invalid value for key s`, every pngjs failure is
+`EBADPNG:invalid PNG`). Log lines name an action or selector only when it is a known one; the
+logged APC keys go through the same sanitising.
+
+## Security: untrusted child output
+
+Everything the child writes is treated as untrusted input.
+
+**File transports (`t=f`, `t=t`).** They are on by default (Claude Mods can use file image sources),
+and `--no-files` turns both off (`EINVAL:file transmission is not supported`). The path comes from
+the payload, so `src/kitty/files.ts` enforces a policy before the engine sees any data:
+
+- Only absolute drive paths (`^[A-Za-z]:[\\/]`) are accepted. Rejected: anything starting with two
+  separators (UNC `\\server\share`, `\\.\` and `\\?\` device namespaces, `//`), relative and
+  drive-relative paths (`C:x`), NUL, a `:` after the drive (alternate data streams), and any path
+  whose basename stem is a DOS device (CON PRN AUX NUL COM1–9 LPT1–9, case-insensitive, trailing
+  spaces ignored).
+- `path.resolve`, then `lstat`: regular files only, no directory, symlink, reparse point or device.
+  The file is then opened and `fstat`ed, and the handle must be the same file (`dev`/`ino`) as the
+  one checked, so it cannot be swapped for a link in between.
+- Its size must be at most the image limit (64 MiB) and the `O`/`S` range must lie inside it,
+  checked before any byte is read.
+- The read (`FileHandle.readFile` with `AbortSignal.timeout(2000)`), together with the checks, is
+  raced against a 2 s timer, so a stalled volume (a mapped network drive, say) errors instead of
+  freezing the pipeline.
+- Every failure gives exactly one status, `EBADF:Failed to read image file`, with no detail, so
+  the response says nothing about whether a path exists, how large it is or whether it is readable.
+- A `t=t` file is deleted only when the resolved path lies inside `os.tmpdir()` (resolved, and
+  `path.relative` neither starting with `..` nor absolute) and its basename contains
+  `tty-graphics-protocol`. Nothing else is ever deleted, whether or not the decode succeeds.
+  `X\tty-graphics-protocol\..\victim.txt` resolves to `X\victim.txt` and is not deleted.
+
+A read that stalls inside the OS still holds a libuv threadpool thread until the OS returns. The
+pipeline goes on, but repeated stalls could exhaust the pool's four threads.
+
+**Allocation bounds.** A placement (normal or virtual, `c`/`r` given or derived from the aspect
+ratio) larger than 1024 cells on a side is refused with `EINVAL:placement too large`. Any scaled
+image (normal placements in `emit.ts`, virtual ones in `placeholders.ts`) is capped at 8192 pixels a
+side and 16,777,216 pixels in area. A larger box is scaled down proportionally, and the image then
+draws smaller than its cells. For a virtual placement the strips are cut with a matching smaller
+cell, so they still tile. Decoded images are capped at 64 MiB of RGBA, payloads at 32 MiB, and the
+image store at 256 MiB (LRU).
+
+**The console-mode helper** (`host/console.ts`, only on Node < 24 or `--vt-input always`) starts
+`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` by absolute path, never by a PATH
+lookup. If that file does not exist, the helper is skipped with a log line.
 
 ## Environment of the child
 

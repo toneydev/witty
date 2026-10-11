@@ -112,7 +112,8 @@ async function main(argv: readonly string[]): Promise<void> {
   log(`cell size ${formatCell(cell)} (${cellSource}), ${learned.leftover.length} leftover input bytes`)
 
   log(`scale ${options.scale}`)
-  const wire = await createWire({ cellSize: () => cell, log, scale: options.scale })
+  log(`file transports ${options.files ? 'on (policy-checked)' : 'off (--no-files)'}`)
+  const wire = await createWire({ cellSize: () => cell, log, scale: options.scale, files: options.files })
 
   const env: Record<string, string | undefined> = { ...process.env, WITTY: '1' }
   if (options.force) env.CLAUDE_CODE_FORCE_TERMINAL_IMAGES = '1'

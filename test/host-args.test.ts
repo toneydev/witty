@@ -51,6 +51,12 @@ describe('parseArgs', () => {
     assert.throws(() => parseArgs(['--vt-input', 'maybe']), UsageError)
   })
 
+  it('file transports are on by default; --no-files turns them off', () => {
+    assert.equal(parseArgs([]).files, true)
+    assert.equal(parseArgs(['--no-files', 'claude']).files, false)
+    assert.equal(parseArgs(['--', '--no-files']).files, true, 'after -- it belongs to the command')
+  })
+
   it('parses --scale auto|nearest|smooth (default auto) and rejects anything else', () => {
     assert.equal(parseArgs([]).scale, 'auto')
     assert.equal(parseArgs(['--scale', 'nearest']).scale, 'nearest')

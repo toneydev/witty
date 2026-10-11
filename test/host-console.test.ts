@@ -5,7 +5,9 @@
 import assert from 'node:assert/strict'
 import { after, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { rawModeIsVt } from '../src/host/console.ts'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+import { powershellPath, rawModeIsVt } from '../src/host/console.ts'
 import { hex, inputLines, startOuter, withTimeout, type Outer } from './fixtures/harness.ts'
 
 const MOUSE = '\x1b[<0;5;6M'
@@ -35,7 +37,24 @@ async function run(phase: string): Promise<{ modes: string; input: string; outpu
   return { modes: modes?.[0] ?? '', input: inputLines(output).join(''), output }
 }
 
-describe('raw-mode VT input on this Node', () => {
+describe('the PowerShell helper path', () => {
+  it('is the system powershell.exe by absolute path, from SystemRoot', () => {
+    assert.equal(
+      powershellPath({ SystemRoot: 'D:\\Win' }),
+      'D:\\Win\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+    )
+    assert.equal(powershellPath({}), 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+    // Not a bare name: a powershell.exe on PATH or in the working directory is never used.
+    assert.ok(path.win32.isAbsolute(powershellPath()))
+    if (process.platform === 'win32') assert.ok(existsSync(powershellPath()), powershellPath())
+  })
+})
+
+// Concurrent: each probe runs in its own outer pty, so it has its own ConPTY
+// and console, and the PowerShell helper attaches to the probe's console (by
+// the probe's pid), never to this test process's. No test changes the
+// console mode of the process running the tests, so none needs to be serial.
+describe('raw-mode VT input on this Node', { concurrency: true }, () => {
   it('reports raw mode as RAW_VT on Node >= 24', () => {
     assert.equal(rawModeIsVt('24.20.0'), true)
     assert.equal(rawModeIsVt('22.18.0'), false)

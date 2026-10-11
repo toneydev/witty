@@ -12,6 +12,7 @@
 // virtual placements the pass draws placeholder cells from.
 
 import type { ApcSplitter, CellSize, EngineEvent, KittyCommand, KittyEngine, PlaceEmitter, PlaceholderPass, ScaleMode, SplitItem } from './types.ts'
+import { printable } from './kitty/command.ts'
 import { VirtualPlacements, createPlaceholderPass } from './term/placeholders.ts'
 
 export type PipelineOptions = {
@@ -48,6 +49,8 @@ export type WireOptions = {
   log: (line: string) => void
   /** How placed images are scaled to their cell box (`--scale`). Default 'auto'. */
   scale?: ScaleMode
+  /** Allow the file transports (`t=f`, `t=t`) under witty's file policy. Default true; `--no-files` sets false. */
+  files?: boolean
 }
 
 /** The three injected pieces of the pipeline. */
@@ -78,7 +81,8 @@ function describe(command: KittyCommand): string {
   const keys = Object.entries(command.keys)
     .map(([k, v]) => `${k}=${v}`)
     .join(',')
-  return `apc ${keys} (payload ${command.payload.length} bytes)`
+  // Keys come from the child: sanitised so they cannot forge or garble log lines.
+  return `apc ${printable(keys, 512)} (payload ${command.payload.length} bytes)`
 }
 
 export function createPipeline(options: PipelineOptions): Pipeline {

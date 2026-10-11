@@ -30,6 +30,17 @@
 //   undoes anything the helper set.
 
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+
+/**
+ * Where the helper's powershell.exe lives: always the system copy by
+ * absolute path, never a PATH lookup (a powershell.exe in the working
+ * directory or earlier on PATH must not run).
+ */
+export function powershellPath(env: Record<string, string | undefined> = process.env): string {
+  return path.win32.join(env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+}
 
 /** Console input mode bit: deliver input as VT sequences. */
 export const ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
@@ -104,9 +115,11 @@ export function setConsoleModes(options: SetConsoleModesOptions = {}): Promise<C
   const outSet = options.outputSet ?? 0
   const command = `& { ${HELPER_SCRIPT} } ${inSet} ${inClear} ${outSet} ${process.pid}`
   const encoded = Buffer.from(command, 'utf16le').toString('base64')
+  const exe = powershellPath()
+  if (!existsSync(exe)) return Promise.reject(new Error(`${exe} not found`))
   return new Promise((resolve, reject) => {
     const child = spawn(
-      'powershell.exe',
+      exe,
       ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
       { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
     )
@@ -162,6 +175,8 @@ export async function ensureVtInput(policy: VtInputPolicy = 'auto'): Promise<str
   if (policy === 'never' || (policy === 'auto' && rawModeIsVt())) {
     return `vt input: raw mode on Node ${process.versions.node} is RAW_VT, no helper run`
   }
+  const exe = powershellPath()
+  if (!existsSync(exe)) return `vt input: helper skipped, ${exe} not found`
   try {
     const modes = await setConsoleModes({
       inputSet: ENABLE_VIRTUAL_TERMINAL_INPUT,

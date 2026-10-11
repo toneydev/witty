@@ -38,7 +38,7 @@ import type {
 } from '../types.ts'
 import { cropRgba } from '../image/crop.ts'
 import { diacriticIndex } from './diacritics.ts'
-import { encodePlaceholderStrip, scaleToBox } from './emit.ts'
+import { encodePlaceholderStrip, placementGeometry, scaleToBox } from './emit.ts'
 
 /** U+10EEEE in UTF-8. */
 const PLACEHOLDER = [0xf4, 0x8e, 0xbb, 0xae] as const
@@ -99,6 +99,8 @@ type PlacementCache = {
   cellWidth: number
   cellHeight: number
   scaled: Rgba
+  /** The cell size the scaled image is cut by (smaller than the real cell when the box was capped). */
+  cut: CellSize
   strips: Map<string, Uint8Array>
 }
 
@@ -333,14 +335,17 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
     }
     let cache = caches.get(placement)
     if (cache === undefined || cache.cellWidth !== cellWidth || cache.cellHeight !== cellHeight) {
-      const scaled = scaleToBox(placement.image, columns, rows, { width: cellWidth, height: cellHeight }, scale)
-      cache = { cellWidth, cellHeight, scaled, strips: new Map() }
+      const cell = { width: cellWidth, height: cellHeight }
+      const scaled = scaleToBox(placement.image, columns, rows, cell, scale)
+      // A box too large for the pixel cap is scaled down: cut it by the shrunk cell.
+      const cut = placementGeometry(columns, rows, cell).cell
+      cache = { cellWidth, cellHeight, scaled, cut, strips: new Map() }
       caches.set(placement, cache)
     }
     const key = `${row},${c0},${n}`
     let bytes = cache.strips.get(key)
     if (bytes === undefined) {
-      const { x0, x1, y0, y1 } = stripRect(row, c0, n, { width: cellWidth, height: cellHeight })
+      const { x0, x1, y0, y1 } = stripRect(row, c0, n, cache.cut)
       const strip = cropRgba(cache.scaled, x0, y0, x1 - x0, y1 - y0)
       bytes = encodePlaceholderStrip(strip, n, sixelOptions)
       if (cache.strips.size >= MAX_STRIPS_PER_PLACEMENT) cache.strips.clear()

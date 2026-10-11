@@ -1,8 +1,15 @@
 // End to end: `node src/cli.ts` with the stub wire, hosting the fake child,
 // inside an outer bundled ConPTY that plays Windows Terminal.
+//
+// The tests run concurrently: each has its own outer pty (its own ConPTY,
+// so its own console), its own witty and child processes and its own log
+// file (numbered by `startWitty`); the shared temp directory only holds
+// those per-run files and is removed after all of them. Nothing here blocks
+// the event loop (no spawnSync), so the harnesses keep reading their ptys
+// while another test waits.
 
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -53,7 +60,30 @@ async function waitForInput(outer: Outer, bytes: string, timeoutMs = 10000): Pro
   }
 }
 
-describe('witty end to end', () => {
+/** Runs `node <args>` without a terminal, asynchronously; resolves with its exit status and output. */
+function runNode(args: string[], timeoutMs = 15000): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.setEncoding('utf8').on('data', (s: string) => (stdout += s))
+    child.stderr.setEncoding('utf8').on('data', (s: string) => (stderr += s))
+    const timer = setTimeout(() => {
+      child.kill()
+      reject(new Error(`node ${args.join(' ')} timed out; stdout ${JSON.stringify(stdout)} stderr ${JSON.stringify(stderr)}`))
+    }, timeoutMs)
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+    child.on('close', (status) => {
+      clearTimeout(timer)
+      resolve({ status, stdout, stderr })
+    })
+  })
+}
+
+describe('witty end to end', { concurrency: true }, () => {
   it('translates the APC in place, answers the child, forwards input and resizes, exits with the child code', async () => {
     const { outer, readLog } = startWitty({ cellSize: { width: 9, height: 17 } })
     await outer.waitFor('READY', 30000)
@@ -148,17 +178,16 @@ describe('witty end to end', () => {
     assert.match(outer.output(), /command not found: no-such-program-witty/)
   })
 
-  it('refuses to run without a terminal', () => {
-    const r = spawnSync(process.execPath, [cli, '--', 'cmd'], { encoding: 'utf8', timeout: 15000 })
+  it('refuses to run without a terminal', async () => {
+    const r = await runNode([cli, '--', 'cmd'])
     assert.equal(r.status, 2)
     assert.match(r.stderr, /must be a terminal/)
   })
 
-  it('prints help and version', () => {
-    const help = spawnSync(process.execPath, [cli, '--help'], { encoding: 'utf8', timeout: 15000 })
+  it('prints help and version', async () => {
+    const [help, version] = await Promise.all([runNode([cli, '--help']), runNode([cli, '--version'])])
     assert.equal(help.status, 0)
     assert.match(help.stdout, /Usage: witty/)
-    const version = spawnSync(process.execPath, [cli, '--version'], { encoding: 'utf8', timeout: 15000 })
     assert.equal(version.status, 0)
     assert.match(version.stdout, /^witty \d+\.\d+\.\d+/)
   })
