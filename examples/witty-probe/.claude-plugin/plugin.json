@@ -1,0 +1,1 @@
+{ "name": "witty-probe", "version": "0.1.0", "description": "Draws the same 8x4 sprite as an Image (kitty graphics) and as a Raster (half-block cells) above the prompt, to see which this terminal shows." }
