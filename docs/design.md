@@ -169,7 +169,11 @@ image store at 256 MiB (LRU).
 
 **The console-mode helper** (`host/console.ts`, only on Node < 24 or `--vt-input always`) starts
 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` by absolute path, never by a PATH
-lookup. If that file does not exist, the helper is skipped with a log line.
+lookup. If that file does not exist, the helper is skipped with a log line. It declares its
+P/Invoke calls with Reflection.Emit rather than Add-Type, so no C# compiler runs and no temp files are
+written; on a cold CI runner, Add-Type compiling with csc ran past the old 10 s timeout. The timeout
+is now 30 s (`WITTY_CONSOLE_HELPER_TIMEOUT_MS` overrides it), and a failure is never fatal: the log
+line carries the helper's stderr and witty goes on without VT input.
 
 ## Environment of the child
 

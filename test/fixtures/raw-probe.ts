@@ -18,15 +18,33 @@ const out = (s: string): void => {
   process.stdout.write(s)
 }
 
+/** Reports a helper failure as one line (`HELPER:failed <step> <json message>`) instead of crashing. */
+const failed = (step: string, error: unknown): void => {
+  const message = error instanceof Error ? error.message : String(error)
+  out(`HELPER:failed ${step} ${JSON.stringify(message)}\r\n`)
+}
+
 process.stdin.setRawMode(true)
 if (phase === 'clear' || phase === 'restore') {
-  await setConsoleModes({ inputClear: ENABLE_VIRTUAL_TERMINAL_INPUT })
+  try {
+    await setConsoleModes({ inputClear: ENABLE_VIRTUAL_TERMINAL_INPUT })
+  } catch (error) {
+    failed('clear', error)
+  }
 }
 if (phase === 'restore') {
-  out(`HELPER ${await ensureVtInput('always')}\r\n`)
+  // ensureVtInput never throws; a failure comes back as its log line.
+  const line = await ensureVtInput('always')
+  out(`HELPER ${line}\r\n`)
+  if (!/helper set modes/.test(line)) failed('restore', line)
 }
-const modes = await setConsoleModes()
-out(`MODES ${modes.inputAfter.toString(16)} ${modes.outputAfter.toString(16)}\r\n`)
+try {
+  const modes = await setConsoleModes()
+  out(`MODES ${modes.inputAfter.toString(16)} ${modes.outputAfter.toString(16)}\r\n`)
+} catch (error) {
+  out('MODES unknown\r\n')
+  failed('modes', error)
+}
 out('\x1b[?1000h\x1b[?1006h')
 out('READY\r\n')
 

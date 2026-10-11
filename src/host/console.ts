@@ -62,8 +62,24 @@ export type SetConsoleModesOptions = {
   inputClear?: number
   /** Bits to OR into the CONOUT$ mode. */
   outputSet?: number
-  /** Give up after this many ms. Default 10000. */
+  /** Give up after this many ms. Default {@link helperTimeoutMs}: 30 s, or WITTY_CONSOLE_HELPER_TIMEOUT_MS. */
   timeoutMs?: number
+}
+
+/** How long the helper may take by default: a cold PowerShell start on a CI runner can take many seconds. */
+export const CONSOLE_HELPER_TIMEOUT_MS = 30_000
+
+/** The helper timeout: `WITTY_CONSOLE_HELPER_TIMEOUT_MS` when it is a positive integer, else 30 s. */
+export function helperTimeoutMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.WITTY_CONSOLE_HELPER_TIMEOUT_MS
+  const value = raw !== undefined && /^\d{1,7}$/.test(raw.trim()) ? Number(raw.trim()) : 0
+  return value > 0 ? value : CONSOLE_HELPER_TIMEOUT_MS
+}
+
+/** One line of helper output for an error message: whitespace collapsed, cut to `max` characters. */
+function oneLine(text: string, max = 2000): string {
+  const line = text.replace(/\s+/g, ' ').trim()
+  return line.length > max ? `${line.slice(0, max)}...` : line
 }
 
 // powershell.exe retitles whatever console it starts in, and in a
@@ -73,34 +89,55 @@ export type SetConsoleModesOptions = {
 // inherited stdio give CREATE_NO_WINDOW), then FreeConsole + AttachConsole
 // moves it onto ours, where it opens CONIN$/CONOUT$ (its std handles are
 // pipes) and changes the modes. Nothing is ever written to our screen.
+//
+// The P/Invoke declarations are built with Reflection.Emit (DefineMethod with
+// PinvokeImpl plus a DllImport attribute), not Add-Type: Add-Type runs the C#
+// compiler (csc.exe, writing and loading temp .cs/.dll files), which on a
+// cold CI runner took longer than the old 10 s timeout. Emit needs no
+// compiler and no files; measured warm locally it is ~50 ms against ~83 ms
+// for Add-Type, and it does not depend on csc or the temp directory at all.
 const HELPER_SCRIPT = String.raw`
 param([uint32]$InSet, [uint32]$InClear, [uint32]$OutSet, [uint32]$AttachPid)
-Add-Type -Namespace WittyConsole -Name Native -MemberDefinition @'
-[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-public static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
-[DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetConsoleMode(IntPtr h, out uint mode);
-[DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleMode(IntPtr h, uint mode);
-[DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
-[DllImport("kernel32.dll", SetLastError=true)] public static extern bool FreeConsole();
-[DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint pid);
-'@
-if ($AttachPid -ne 0) {
-  [void][WittyConsole.Native]::FreeConsole()
-  if (-not [WittyConsole.Native]::AttachConsole($AttachPid)) { throw "AttachConsole($AttachPid) failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+$ErrorActionPreference = 'Stop'
+$asm = [AppDomain]::CurrentDomain.DefineDynamicAssembly((New-Object Reflection.AssemblyName 'WittyConsole'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+$tb = $asm.DefineDynamicModule('WittyConsole').DefineType('WittyConsole.Native', 'Public, Class, Sealed')
+$di = [Runtime.InteropServices.DllImportAttribute]
+$ctor = $di.GetConstructor([Type[]]@([string]))
+$fields = [Reflection.FieldInfo[]]@($di.GetField('SetLastError'), $di.GetField('CharSet'))
+$values = [object[]]@($true, [Runtime.InteropServices.CharSet]::Unicode)
+function Native([string]$Name, [Type]$Ret, [Type[]]$Params) {
+  $m = $tb.DefineMethod($Name, 'Public, Static, PinvokeImpl, HideBySig', $Ret, $Params)
+  $m.SetCustomAttribute((New-Object Reflection.Emit.CustomAttributeBuilder($ctor, [object[]]@('kernel32.dll'), $fields, $values)))
 }
-function Open($name) { [WittyConsole.Native]::CreateFileW($name, [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero) }
+Native 'CreateFileW' ([IntPtr]) @([string], [uint32], [uint32], [IntPtr], [uint32], [uint32], [IntPtr])
+Native 'GetConsoleMode' ([bool]) @([IntPtr], [uint32].MakeByRefType())
+Native 'SetConsoleMode' ([bool]) @([IntPtr], [uint32])
+Native 'CloseHandle' ([bool]) @([IntPtr])
+Native 'FreeConsole' ([bool]) $null
+Native 'AttachConsole' ([bool]) @([uint32])
+$N = $tb.CreateType()
+function LastError { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+if ($AttachPid -ne 0) {
+  [void]$N::FreeConsole()
+  if (-not $N::AttachConsole($AttachPid)) { throw "AttachConsole($AttachPid) failed: error $(LastError)" }
+}
+function Open($name) {
+  $h = $N::CreateFileW($name, [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+  if ($h -eq [IntPtr]::Zero -or $h -eq [IntPtr]::new(-1)) { throw "CreateFile($name) failed: error $(LastError)" }
+  $h
+}
 $in = Open 'CONIN$'; $out = Open 'CONOUT$'
 $ib = [uint32]0; $ob = [uint32]0
-if (-not [WittyConsole.Native]::GetConsoleMode($in, [ref]$ib)) { throw 'GetConsoleMode(CONIN$) failed' }
-if (-not [WittyConsole.Native]::GetConsoleMode($out, [ref]$ob)) { throw 'GetConsoleMode(CONOUT$) failed' }
+if (-not $N::GetConsoleMode($in, [ref]$ib)) { throw "GetConsoleMode(CONIN) failed: error $(LastError)" }
+if (-not $N::GetConsoleMode($out, [ref]$ob)) { throw "GetConsoleMode(CONOUT) failed: error $(LastError)" }
 $im = [uint32](($ib -band (-bnot $InClear)) -bor $InSet)
 $om = [uint32]($ob -bor $OutSet)
-if ($im -ne $ib) { [void][WittyConsole.Native]::SetConsoleMode($in, $im) }
-if ($om -ne $ob) { [void][WittyConsole.Native]::SetConsoleMode($out, $om) }
+if ($im -ne $ib -and -not $N::SetConsoleMode($in, $im)) { throw "SetConsoleMode(CONIN) failed: error $(LastError)" }
+if ($om -ne $ob -and -not $N::SetConsoleMode($out, $om)) { throw "SetConsoleMode(CONOUT) failed: error $(LastError)" }
 $ia = [uint32]0; $oa = [uint32]0
-[void][WittyConsole.Native]::GetConsoleMode($in, [ref]$ia)
-[void][WittyConsole.Native]::GetConsoleMode($out, [ref]$oa)
-[void][WittyConsole.Native]::CloseHandle($in); [void][WittyConsole.Native]::CloseHandle($out)
+[void]$N::GetConsoleMode($in, [ref]$ia)
+[void]$N::GetConsoleMode($out, [ref]$oa)
+[void]$N::CloseHandle($in); [void]$N::CloseHandle($out)
 "WITTY-MODES $ib $ob $ia $oa"
 `
 
@@ -127,21 +164,33 @@ export function setConsoleModes(options: SetConsoleModesOptions = {}): Promise<C
     let stderr = ''
     child.stdout.setEncoding('utf8').on('data', (s: string) => (stdout += s))
     child.stderr.setEncoding('utf8').on('data', (s: string) => (stderr += s))
+    const timeoutMs = options.timeoutMs ?? helperTimeoutMs()
+    const started = Date.now()
+    let settled = false
+    const fail = (message: string): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(new Error(message))
+    }
     const timer = setTimeout(() => {
       child.kill()
-      reject(new Error('console mode helper timed out'))
-    }, options.timeoutMs ?? 10000)
-    child.on('error', (error) => {
-      clearTimeout(timer)
-      reject(error)
-    })
+      fail(
+        `console mode helper timed out after ${timeoutMs} ms; stderr: ${oneLine(stderr) || '(none)'}; stdout: ${oneLine(stdout) || '(none)'}`,
+      )
+    }, timeoutMs)
+    child.on('error', (error) => fail(`console mode helper could not start: ${error.message}`))
     child.on('close', (code) => {
-      clearTimeout(timer)
+      if (settled) return
       const m = /WITTY-MODES (\d+) (\d+) (\d+) (\d+)/.exec(stdout)
       if (code !== 0 || m === null) {
-        reject(new Error(`console mode helper failed (exit ${code}): ${stderr.trim() || stdout.trim()}`))
+        fail(
+          `console mode helper failed (exit ${code}, ${Date.now() - started} ms); stderr: ${oneLine(stderr) || '(none)'}; stdout: ${oneLine(stdout) || '(none)'}`,
+        )
         return
       }
+      settled = true
+      clearTimeout(timer)
       resolve({
         inputBefore: Number(m[1]),
         outputBefore: Number(m[2]),
@@ -175,9 +224,9 @@ export async function ensureVtInput(policy: VtInputPolicy = 'auto'): Promise<str
   if (policy === 'never' || (policy === 'auto' && rawModeIsVt())) {
     return `vt input: raw mode on Node ${process.versions.node} is RAW_VT, no helper run`
   }
-  const exe = powershellPath()
-  if (!existsSync(exe)) return `vt input: helper skipped, ${exe} not found`
   try {
+    const exe = powershellPath()
+    if (!existsSync(exe)) return `vt input: helper skipped, ${exe} not found`
     const modes = await setConsoleModes({
       inputSet: ENABLE_VIRTUAL_TERMINAL_INPUT,
       outputSet: ENABLE_VIRTUAL_TERMINAL_PROCESSING,
@@ -187,7 +236,8 @@ export async function ensureVtInput(policy: VtInputPolicy = 'auto'): Promise<str
       `out 0x${modes.outputBefore.toString(16)} -> 0x${modes.outputAfter.toString(16)}`
     )
   } catch (error) {
-    return `vt input: helper failed: ${(error as Error).message}`
+    // Non-fatal: witty runs on without VT input (mouse reports may be lost). The message carries the helper's stderr.
+    return `vt input: helper failed, continuing without it: ${error instanceof Error ? error.message : String(error)}`
   }
 }
 
