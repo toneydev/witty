@@ -17,12 +17,31 @@ ConPTY). Nothing to configure in either terminal.
 
 ## Install
 
+### Portable release (no build)
+
+Download `witty-<version>-win-x64.zip` from the [releases page](https://github.com/toneydev/witty/releases),
+extract it anywhere, and either run `witty.cmd` from there or install it for your user:
+
+```powershell
+Expand-Archive witty-0.2.0-win-x64.zip
+powershell -ExecutionPolicy Bypass -File .\witty-0.2.0-win-x64\install.ps1
+```
+
+`install.ps1` copies the folder to `%LOCALAPPDATA%\Programs\witty` and adds it to your user PATH
+(`-Uninstall` reverses both). The zip holds the compiled code and node-pty's prebuilt ConPTY, so the
+only requirement on the machine is Node.js 22.18 or later on PATH.
+
+### From source
+
 ```powershell
 cd C:\Repositories\witty
 npm ci
 npm run build
 npm link          # puts `witty` on PATH; `npm unlink -g witty` removes it
 ```
+
+`pwsh tools\pack-release.ps1` builds the portable zip into `release\`; pushing a `v<version>` tag that
+matches `package.json` publishes it as a GitHub release (`.github/workflows/release.yml`).
 
 ## Use
 
