@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { resizeRgba, resolveScaleMode } from '../src/image/resize.ts'
+import { resizeRegion, resizeRgba, resolveScaleMode } from '../src/image/resize.ts'
+import { cropRgba } from '../src/image/crop.ts'
 import type { Rgba } from '../src/types.ts'
 import { make, pixel, rng, solid } from './helpers/images.ts'
 
@@ -292,4 +293,53 @@ test('scratch memory is bounded by the larger of source and destination, not the
     }
     assertClose(out!, { width: dw, height: dh, data: expected }, label)
   }
+})
+
+test('a region is the top-left of the whole resize: exact for nearest and unchanged sizes, within 1 for smooth', () => {
+  const image = noise(37, 23, 7)
+  const cases: [number, number, number, number][] = [
+    [200, 150, 61, 40], // growing
+    [20, 11, 7, 5], // shrinking
+    [90, 9, 33, 4], // growing across, shrinking down
+    [9, 90, 4, 33], // shrinking across, growing down
+    [37, 50, 20, 17], // one axis unchanged
+    [37, 23, 10, 10], // no scaling at all
+    [74, 46, 74, 46], // the whole box
+    [300, 7, 1, 7], // one column
+  ]
+  for (const mode of ['smooth', 'nearest', 'auto'] as const) {
+    for (const [w, h, rw, rh] of cases) {
+      const label = `${mode} ${w}x${h} -> ${rw}x${rh}`
+      const expected = cropRgba(resizeRgba(image, w, h, { mode }), 0, 0, rw, rh)
+      const region = resizeRegion(image, w, h, rw, rh, { mode })
+      assert.deepEqual([region.width, region.height], [rw, rh], label)
+      if (resolveScaleMode(mode, 37, 23, w, h) === 'nearest' || (w === 37 && h === 23)) assert.deepEqual(region.data, expected.data, label)
+      else assertClose(region, expected, label)
+    }
+  }
+  const copy = resizeRegion(image, 37, 23, 37, 23)
+  assert.notEqual(copy.data, image.data, 'always a new buffer')
+})
+
+test('a region costs what it reads, not the whole box', () => {
+  // 100x100 of a 2048x2048 source enlarged to 4096x4096 (a 64 Mi-pixel box).
+  const square = { width: 2048, height: 2048, data: new Uint8Array(2048 * 2048 * 4) }
+  const largest = largestFloatArray(4 * 100 * 100, () => {
+    resizeRegion(square, 4096, 4096, 100, 100, { mode: 'smooth' })
+  })
+  assert.ok(largest <= 4 * 100 * 100, `largest ${largest}`)
+  // The tall source of the scratch-memory test, clipped to 800x20 of its
+  // 8192x20 box: filtered vertically first over the ~25 columns it reads.
+  const row = make(256, 1, (x) => [x, 255 - x, 0, 255])
+  const tall = { width: 256, height: 65536, data: new Uint8Array(256 * 65536 * 4) }
+  for (let y = 0; y < 65536; y++) tall.data.set(row.data, y * 256 * 4)
+  let out: Rgba | undefined
+  const tallLargest = largestFloatArray(4 * 65536 + 16, () => {
+    out = resizeRegion(tall, 8192, 20, 800, 20, { mode: 'smooth' })
+  })
+  assert.ok(tallLargest <= 65536 + 16, `largest ${tallLargest}`) // the vertical taps, not a float image
+  const line = cropRgba(horizontalFirstReference(row, 8192, 1), 0, 0, 800, 1)
+  const expected = new Uint8Array(800 * 20 * 4)
+  for (let y = 0; y < 20; y++) expected.set(line.data, y * 800 * 4)
+  assertClose(out!, { width: 800, height: 20, data: expected }, 'every row is the stretched source row')
 })

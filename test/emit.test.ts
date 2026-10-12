@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { MAX_BOX_PIXELS, MAX_BOX_SIDE, createPlaceEmitter, emitPlacement, placementGeometry, scaleToBox } from '../src/term/emit.ts'
 import { decodeSixel } from './helpers/sixel-decoder.ts'
-import { make, pixel, solid } from './helpers/images.ts'
+import { make, pixel, rng, solid } from './helpers/images.ts'
 import type { CursorPolicy, EngineEvent, Rgba } from '../src/types.ts'
 
 type Place = Extract<EngineEvent, { kind: 'place' }>
@@ -118,4 +118,102 @@ test('options reach the encoder', () => {
   const out = createPlaceEmitter({ maxColors: 8 })(place(image, 8, 1, 'stay'), { width: 8, height: 4 })
   const d = decodeSixel(split(text(out)).sixel)
   assert.ok(d.palette.size <= 8)
+})
+
+// Clipping to the screen, and the placement cache.
+
+const raster = (out: Uint8Array) => decodeSixel(split(text(out)).sixel).raster!
+
+/** A busy opaque image of at most 64 distinct colours (so quantization is exact). */
+function busy(width: number, height: number, seed: number): Rgba {
+  const r = rng(seed)
+  return make(width, height, () => [Math.floor(r() * 4) * 85, Math.floor(r() * 4) * 85, Math.floor(r() * 4) * 85, 255])
+}
+
+test('a box larger than the screen draws only what the screen shows: c=819,r=400 on 80x24', () => {
+  const cell = { width: 10, height: 20 }
+  const event = place(busy(256, 128, 1), 819, 400, 'move')
+  const out = createPlaceEmitter()(event, cell, { columns: 80, rows: 24 })
+  const [, , width, height] = raster(out)
+  assert.ok(width <= 80 * cell.width && height <= 24 * cell.height, `${width}x${height}`)
+  assert.ok(out.length <= 80 * cell.width * 24 * cell.height * 5, `${out.length} bytes`)
+  assert.ok(split(text(out)).tail === '\x1b8\x1b[399B\x1b[819C', 'the cursor still moves past the whole box')
+})
+
+test('clipped output is the top-left of the unclipped output (fractional cells)', () => {
+  const cell = { width: 9.375, height: 18.5 }
+  const event = place(busy(41, 29, 2), 100, 40, 'stay')
+  const emit = createPlaceEmitter({ scale: 'nearest', cacheBytes: 0 })
+  const whole = decodeSixel(split(text(emit(event, cell))).sixel).image
+  const clipped = decodeSixel(split(text(emit(event, cell, { columns: 80, rows: 24 }))).sixel).image
+  assert.deepEqual([whole.width, whole.height], [938, 740]) // round(937.5), 740
+  assert.deepEqual([clipped.width, clipped.height], [750, 444]) // round(80 * 9.375), round(24 * 18.5)
+  for (let y = 0; y < clipped.height; y++) {
+    for (let x = 0; x < clipped.width; x++) {
+      const a = pixel(clipped, x, y)
+      const b = pixel(whole, x, y)
+      for (let c = 0; c < 4; c++) assert.ok(Math.abs(a[c]! - b[c]!) <= 1, `(${x},${y}) ${a} vs ${b}`)
+    }
+  }
+})
+
+test('the screen clips each axis on its own; an unknown or larger screen changes nothing', () => {
+  const cell = { width: 8, height: 16 }
+  const event = place(busy(30, 20, 3), 100, 40, 'move')
+  const emit = createPlaceEmitter({ cacheBytes: 0 })
+  const base = emit(event, cell)
+  for (const screen of [undefined, { columns: 0, rows: 0 }, { columns: 100, rows: 40 }, { columns: 200, rows: 90 }]) {
+    assert.deepEqual(emit(event, cell, screen), base, JSON.stringify(screen))
+  }
+  assert.deepEqual(raster(emit(event, cell, { columns: 0, rows: 24 })).slice(2), [800, 384])
+  assert.deepEqual(raster(emit(event, cell, { columns: 80, rows: 0 })).slice(2), [640, 640])
+})
+
+test('a capped box is clipped in screen pixels', () => {
+  // 1000x1000 cells of 10x20 scale to a capped box under 8192 a side; the
+  // screen still shows 800x480 pixels of it.
+  const cell = { width: 10, height: 20 }
+  const out = createPlaceEmitter({ scale: 'nearest' })(place(busy(16, 16, 4), 1000, 1000, 'stay'), cell, { columns: 80, rows: 24 })
+  assert.deepEqual(raster(out).slice(2), [800, 480])
+})
+
+test('repeated puts of the same image reuse the encoded bytes', () => {
+  const cell = { width: 10, height: 20 }
+  const screen = { columns: 80, rows: 24 }
+  const image = busy(64, 32, 5)
+  const emit = createPlaceEmitter()
+  const first = emit(place(image, 819, 400, 'move'), cell, screen)
+  assert.equal(emit(place(image, 819, 400, 'move'), cell, { ...screen }), first, 'same image, box, cell and screen')
+  // Anything the bytes depend on misses: cell size, screen, box, cursor policy, image object.
+  for (const other of [
+    emit(place(image, 819, 400, 'move'), { width: 9, height: 20 }, screen),
+    emit(place(image, 819, 400, 'move'), cell, { columns: 70, rows: 24 }),
+    emit(place(image, 818, 400, 'move'), cell, screen),
+    emit(place(image, 819, 400, 'stay'), cell, screen),
+    emit(place({ ...image }, 819, 400, 'move'), cell, screen),
+  ]) {
+    assert.notEqual(other, first)
+  }
+  assert.deepEqual(emit(place({ ...image }, 819, 400, 'move'), cell, screen), first, 'a copy encodes the same')
+  // A screen that grew past the box still hits (nothing more is visible).
+  const small = place(image, 4, 2, 'move')
+  const a = emit(small, cell, screen)
+  assert.equal(emit(small, cell, { columns: 200, rows: 60 }), a)
+  assert.equal(emit(small, cell), a)
+})
+
+test('the cache is bounded: least recently used first out, oversized outputs never kept', () => {
+  const cell = { width: 8, height: 16 }
+  const a = place(busy(8, 8, 6), 4, 2, 'stay')
+  const b = place(busy(8, 8, 7), 4, 2, 'stay')
+  const size = createPlaceEmitter({ cacheBytes: 0 })(a, cell).length
+  const emit = createPlaceEmitter({ cacheBytes: Math.floor(size * 1.5) })
+  const a1 = emit(a, cell)
+  assert.equal(emit(a, cell), a1)
+  emit(b, cell) // evicts a
+  assert.notEqual(emit(a, cell), a1)
+  const none = createPlaceEmitter({ cacheBytes: 0 })
+  assert.notEqual(none(a, cell), none(a, cell))
+  const tight = createPlaceEmitter({ cacheBytes: size - 1 })
+  assert.notEqual(tight(a, cell), tight(a, cell))
 })

@@ -163,6 +163,7 @@ async function main(argv: readonly string[]): Promise<void> {
     engine: wire.engine,
     emitter: wire.emitter,
     cellSize: () => cell,
+    screen: () => ({ columns: process.stdout.columns || 0, rows: process.stdout.rows || 0 }),
     writeOut,
     writeChild: (data) => spawned.write(data),
     log,

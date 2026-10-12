@@ -1,4 +1,5 @@
-// Scales an RGBA bitmap to an exact pixel box.
+// Scales an RGBA bitmap to an exact pixel box, or computes only the top-left
+// region of that scaled box.
 //
 // Two modes. 'nearest' copies the source pixel under each destination pixel's
 // centre: sharp blocks, for pixel art, icons and sprites. 'smooth' filters.
@@ -13,28 +14,35 @@
 // not bleed their (usually black) colour into the edges of opaque ones, and is
 // un-premultiplied on output.
 //
+// Regions. resizeRegion computes the top-left rw × rh pixels of the dw × dh
+// result (a placement clipped at the screen edge, src/term/emit.ts) with the
+// same taps, reading only the sx × sy source rectangle they touch. The whole
+// resize is the region that is the whole box.
+//
 // Cost. The source is untrusted and need not resemble the box: a decoded image
 // may be up to 64 MiB of RGBA in any shape (say 256 × 65536), and only the
 // destination is capped (src/term/emit.ts). The two passes commute, so the
-// first pass is whichever axis gives the smaller intermediate, min(dw × sh,
-// sw × dh) float pixels, never their cross product (8 GiB for 256 × 65536 into
+// first pass is whichever axis gives the smaller intermediate, min(rw × sy,
+// sx × rh) float pixels, never their cross product (8 GiB for 256 × 65536 into
 // 8192 × 20 if the horizontal pass always ran first). That minimum is at most
-// max(sw × sh, dw × dh), so scratch memory stays within 4x the larger of the
-// source and destination RGBA bytes (16-byte float pixels), and the work within
-// a small multiple of their pixel counts. The source is premultiplied as each
-// pixel is read, not copied whole.
+// max(sx × sy, rw × rh) (the two products multiply to the same thing), so
+// scratch memory stays within 4x the larger of the source rectangle's and the
+// region's RGBA bytes (16-byte float pixels), and the work within a small
+// multiple of their pixel counts. The source is premultiplied as each pixel is
+// read, not copied whole.
 
 import type { Rgba, ScaleMode } from '../types.ts'
 
 /** Filter taps for one axis: destination i reads `index[k]` × `weight[k]` for k in `[offset[i], offset[i+1])`. */
 type Taps = { offset: Int32Array; index: Int32Array; weight: Float64Array }
 
-function axisTaps(src: number, dst: number): Taps {
+/** The taps of destination pixels `0..n-1` when scaling `src` pixels to `dst`. */
+function axisTaps(src: number, dst: number, n: number): Taps {
   const index: number[] = []
   const weight: number[] = []
-  const offset = new Int32Array(dst + 1)
+  const offset = new Int32Array(n + 1)
   if (dst === src) {
-    for (let i = 0; i < dst; i++) {
+    for (let i = 0; i < n; i++) {
       offset[i] = i
       index.push(i)
       weight.push(1)
@@ -42,7 +50,7 @@ function axisTaps(src: number, dst: number): Taps {
   } else if (dst < src) {
     // Box filter: destination pixel i covers source interval [i*s, (i+1)*s).
     const scale = src / dst
-    for (let i = 0; i < dst; i++) {
+    for (let i = 0; i < n; i++) {
       offset[i] = index.length
       const lo = i * scale
       const hi = Math.min(src, (i + 1) * scale)
@@ -57,7 +65,7 @@ function axisTaps(src: number, dst: number): Taps {
   } else {
     // Bilinear: map destination pixel centres onto source pixel centres.
     const scale = src / dst
-    for (let i = 0; i < dst; i++) {
+    for (let i = 0; i < n; i++) {
       offset[i] = index.length
       const x = (i + 0.5) * scale - 0.5
       if (x <= 0) {
@@ -78,8 +86,15 @@ function axisTaps(src: number, dst: number): Taps {
       }
     }
   }
-  offset[dst] = index.length
+  offset[n] = index.length
   return { offset, index: Int32Array.from(index), weight: Float64Array.from(weight) }
+}
+
+/** How many source pixels `taps` reach into: one past the highest index read. */
+function tapExtent(taps: Taps): number {
+  let max = 0
+  for (const i of taps.index) if (i > max) max = i
+  return max + 1
 }
 
 export type ResizeOptions = {
@@ -108,34 +123,68 @@ export function resolveScaleMode(mode: ScaleMode, sw: number, sh: number, dw: nu
  * unchanged (then the data is a plain copy), so callers may mutate it freely.
  */
 export function resizeRgba(image: Rgba, width: number, height: number, options: ResizeOptions = {}): Rgba {
+  return resizeRegion(image, width, height, width, height, options)
+}
+
+/**
+ * The top-left `regionWidth` × `regionHeight` pixels (each rounded, at least
+ * 1 and at most the box) of `image` scaled to `width` × `height` as by
+ * {@link resizeRgba}: the same taps and scaling mode (resolved for the whole
+ * box), with only the source pixels the region reads filtered, so the cost
+ * follows the region and that source rectangle, not the whole box. 'nearest'
+ * and an unchanged size give exactly the pixels of the whole resize cropped;
+ * 'smooth' may pick the other pass order than the whole resize would, which
+ * moves a channel by at most 1.
+ *
+ * Always returns a new `Rgba` with its own `data`.
+ */
+export function resizeRegion(
+  image: Rgba,
+  width: number,
+  height: number,
+  regionWidth: number,
+  regionHeight: number,
+  options: ResizeOptions = {},
+): Rgba {
   const dw = Math.max(1, Math.round(width))
   const dh = Math.max(1, Math.round(height))
+  const rw = Math.min(dw, Math.max(1, Math.round(regionWidth)))
+  const rh = Math.min(dh, Math.max(1, Math.round(regionHeight)))
   const sw = image.width
   const sh = image.height
   const src = image.data
-  if (dw === sw && dh === sh) {
-    return { width: sw, height: sh, data: src.slice(0, sw * sh * 4) }
-  }
-  if (resolveScaleMode(options.mode ?? 'auto', sw, sh, dw, dh) === 'nearest') return nearest(image, dw, dh)
+  if (dw === sw && dh === sh) return copyRegion(image, rw, rh)
+  if (resolveScaleMode(options.mode ?? 'auto', sw, sh, dw, dh) === 'nearest') return nearest(image, dw, dh, rw, rh)
 
-  const hx = axisTaps(sw, dw)
-  const vy = axisTaps(sh, dh)
-  const out = new Uint8Array(dw * dh * 4)
-  // The intermediate holds the first pass's output: dw × sh horizontal-first,
-  // sw × dh vertical-first. Take the smaller (ties keep horizontal-first).
-  if (sw * dh < dw * sh) verticalFirst(src, sw, dw, dh, hx, vy, out)
-  else horizontalFirst(src, sw, sh, dw, dh, hx, vy, out)
-  return { width: dw, height: dh, data: out }
+  const hx = axisTaps(sw, dw, rw)
+  const vy = axisTaps(sh, dh, rh)
+  const sx = tapExtent(hx)
+  const sy = tapExtent(vy)
+  const out = new Uint8Array(rw * rh * 4)
+  // The intermediate holds the first pass's output: rw × sy horizontal-first,
+  // sx × rh vertical-first. Take the smaller (ties keep horizontal-first).
+  if (sx * rh < rw * sy) verticalFirst(src, sw, sx, rw, rh, hx, vy, out)
+  else horizontalFirst(src, sw, sy, rw, rh, hx, vy, out)
+  return { width: rw, height: rh, data: out }
 }
 
-/** Smooth, horizontal pass first: sw × sh → dw × sh → dw × dh. */
-function horizontalFirst(src: Uint8Array, sw: number, sh: number, dw: number, dh: number, hx: Taps, vy: Taps, out: Uint8Array): void {
-  // Horizontal pass: sw × sh → dw × sh, premultiplying source pixels as they are read.
-  const mid = new Float32Array(dw * sh * 4)
-  for (let y = 0; y < sh; y++) {
+/** The top-left `rw` × `rh` pixels of `image`, copied. */
+function copyRegion(image: Rgba, rw: number, rh: number): Rgba {
+  const src = image.data
+  if (rw === image.width) return { width: rw, height: rh, data: src.slice(0, rw * rh * 4) }
+  const data = new Uint8Array(rw * rh * 4)
+  for (let y = 0; y < rh; y++) data.set(src.subarray(y * image.width * 4, (y * image.width + rw) * 4), y * rw * 4)
+  return { width: rw, height: rh, data }
+}
+
+/** Smooth, horizontal pass first: sw × sy (source rows 0..sy-1) → rw × sy → rw × rh. */
+function horizontalFirst(src: Uint8Array, sw: number, sy: number, rw: number, rh: number, hx: Taps, vy: Taps, out: Uint8Array): void {
+  // Horizontal pass: sw × sy → rw × sy, premultiplying source pixels as they are read.
+  const mid = new Float32Array(rw * sy * 4)
+  for (let y = 0; y < sy; y++) {
     const srow = y * sw * 4
-    const drow = y * dw * 4
-    for (let x = 0; x < dw; x++) {
+    const drow = y * rw * 4
+    for (let x = 0; x < rw; x++) {
       let r = 0
       let g = 0
       let b = 0
@@ -159,13 +208,13 @@ function horizontalFirst(src: Uint8Array, sw: number, sh: number, dw: number, dh
     }
   }
 
-  // Vertical pass: dw × sh → dw × dh, un-premultiplied into bytes.
-  const rowStride = dw * 4
-  for (let y = 0; y < dh; y++) {
+  // Vertical pass: rw × sy → rw × rh, un-premultiplied into bytes.
+  const rowStride = rw * 4
+  for (let y = 0; y < rh; y++) {
     const start = vy.offset[y]!
     const end = vy.offset[y + 1]!
     const drow = y * rowStride
-    for (let x = 0; x < dw; x++) {
+    for (let x = 0; x < rw; x++) {
       let r = 0
       let g = 0
       let b = 0
@@ -184,19 +233,20 @@ function horizontalFirst(src: Uint8Array, sw: number, sh: number, dw: number, dh
   }
 }
 
-/** Smooth, vertical pass first: sw × sh → sw × dh → dw × dh. */
-function verticalFirst(src: Uint8Array, sw: number, dw: number, dh: number, hx: Taps, vy: Taps, out: Uint8Array): void {
-  // Vertical pass: sw × sh → sw × dh, premultiplying source pixels as they are
+/** Smooth, vertical pass first: sx × sh (source columns 0..sx-1) → sx × rh → rw × rh. */
+function verticalFirst(src: Uint8Array, sw: number, sx: number, rw: number, rh: number, hx: Taps, vy: Taps, out: Uint8Array): void {
+  // Vertical pass: sx × sh → sx × rh, premultiplying source pixels as they are
   // read. Each output row sums its source rows into `acc` front to back, so
   // both are read in memory order.
-  const rowStride = sw * 4
-  const mid = new Float32Array(rowStride * dh)
+  const rowStride = sx * 4
+  const sourceStride = sw * 4
+  const mid = new Float32Array(rowStride * rh)
   const acc = new Float64Array(rowStride)
-  for (let y = 0; y < dh; y++) {
+  for (let y = 0; y < rh; y++) {
     acc.fill(0)
     const end = vy.offset[y + 1]!
     for (let k = vy.offset[y]!; k < end; k++) {
-      const srow = vy.index[k]! * rowStride
+      const srow = vy.index[k]! * sourceStride
       const w = vy.weight[k]!
       for (let p = 0; p < rowStride; p += 4) {
         const s = srow + p
@@ -211,11 +261,11 @@ function verticalFirst(src: Uint8Array, sw: number, dw: number, dh: number, hx: 
     mid.set(acc, y * rowStride)
   }
 
-  // Horizontal pass: sw × dh → dw × dh, un-premultiplied into bytes.
-  for (let y = 0; y < dh; y++) {
+  // Horizontal pass: sx × rh → rw × rh, un-premultiplied into bytes.
+  for (let y = 0; y < rh; y++) {
     const srow = y * rowStride
-    const drow = y * dw * 4
-    for (let x = 0; x < dw; x++) {
+    const drow = y * rw * 4
+    for (let x = 0; x < rw; x++) {
       let r = 0
       let g = 0
       let b = 0
@@ -245,18 +295,21 @@ function unpremultiply(out: Uint8Array, d: number, r: number, g: number, b: numb
   out[d + 3] = ab > 255 ? 255 : ab
 }
 
-/** Nearest-neighbour scaling: destination pixel i reads source pixel floor((i + 0.5) * src / dst). */
-function nearest(image: Rgba, dw: number, dh: number): Rgba {
+/**
+ * Nearest-neighbour scaling to `dw` × `dh`, its top-left `rw` × `rh` pixels:
+ * destination pixel i reads source pixel floor((i + 0.5) * src / dst).
+ */
+function nearest(image: Rgba, dw: number, dh: number, rw: number, rh: number): Rgba {
   const sw = image.width
   const sh = image.height
   const src = image.data
-  const columns = new Int32Array(dw)
-  for (let x = 0; x < dw; x++) columns[x] = Math.min(sw - 1, Math.floor(((x + 0.5) * sw) / dw)) * 4
-  const out = new Uint8Array(dw * dh * 4)
-  for (let y = 0; y < dh; y++) {
+  const columns = new Int32Array(rw)
+  for (let x = 0; x < rw; x++) columns[x] = Math.min(sw - 1, Math.floor(((x + 0.5) * sw) / dw)) * 4
+  const out = new Uint8Array(rw * rh * 4)
+  for (let y = 0; y < rh; y++) {
     const srow = Math.min(sh - 1, Math.floor(((y + 0.5) * sh) / dh)) * sw * 4
-    const drow = y * dw * 4
-    for (let x = 0; x < dw; x++) {
+    const drow = y * rw * 4
+    for (let x = 0; x < rw; x++) {
       const s = srow + columns[x]!
       const d = drow + x * 4
       out[d] = src[s]!
@@ -265,7 +318,7 @@ function nearest(image: Rgba, dw: number, dh: number): Rgba {
       out[d + 3] = src[s + 3]!
     }
   }
-  return { width: dw, height: dh, data: out }
+  return { width: rw, height: rh, data: out }
 }
 
 function clamp(v: number): number {
