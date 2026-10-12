@@ -49,6 +49,17 @@ const MAX_HOLD_BYTES = 64 * 1024
 /** Encoded strips kept per placement before the cache is cleared. */
 const MAX_STRIPS_PER_PLACEMENT = 1024
 
+/**
+ * Default byte budget of the pass's caches (scaled images and encoded
+ * strips), over all placements; the least recently drawn are dropped past
+ * it. Two worst-case boxes (64 MiB of RGBA each) fit, or hundreds of the
+ * images Claude Code draws.
+ */
+export const PLACEHOLDER_CACHE_BYTES = 128 * 1024 * 1024
+
+/** Placements with a cache at once (least recently drawn dropped past it). */
+const MAX_CACHED_PLACEMENTS = 256
+
 /** Distinct unknown image ids logged (each once). */
 const MAX_LOGGED_UNKNOWN = 64
 
@@ -92,6 +103,16 @@ export type PlaceholderPassOptions = {
   scale?: ScaleMode
   /** Diagnostics (`--debug`). */
   log?: (line: string) => void
+  /** Byte budget of the caches over all placements. Default {@link PLACEHOLDER_CACHE_BYTES}. */
+  cacheBytes?: number
+}
+
+/** The pass, plus what its caches hold (for tests and diagnostics). */
+export type PlaceholderPassWithCache = PlaceholderPass & {
+  /** Bytes the caches hold now: scaled images and encoded strips. */
+  readonly cachedBytes: number
+  /** Placements with a cache now. */
+  readonly cachedPlacements: number
 }
 
 /** Per placement: the image scaled to its cell box once per cell size, and the strips encoded from it. */
@@ -102,12 +123,21 @@ type PlacementCache = {
   /** The cell size the scaled image is cut by (smaller than the real cell when the box was capped). */
   cut: CellSize
   strips: Map<string, Uint8Array>
+  /** Bytes of `strips`. */
+  stripBytes: number
+}
+
+/** The pixels a placement shows: its source rectangle of the image, cut out now (the engine never copies it). */
+function sourceOf(placement: VirtualPlacement): Rgba {
+  const { image, source } = placement
+  return source === undefined ? image : cropRgba(image, source.x, source.y, source.width, source.height)
 }
 
 /**
  * The virtual placements known to the pipeline, fed from `virtual` and
  * `delete` events. A new `virtual` for the same image and placement id
- * replaces the old object, which drops its cached strips with it.
+ * replaces the old object; the pass drops the old object's cache the next
+ * time it builds one.
  */
 export class VirtualPlacements implements VirtualRegistry {
   /** image id → placement id (0 for none) → placement, most recently set last. */
@@ -220,11 +250,12 @@ function colonColor(sub: string[]): number | null {
  * object is stateful: feed it every text byte that goes to the terminal, in
  * order, and write out what it returns.
  */
-export function createPlaceholderPass(options: PlaceholderPassOptions): PlaceholderPass {
+export function createPlaceholderPass(options: PlaceholderPassOptions): PlaceholderPassWithCache {
   const { registry, cellSize } = options
   const sixelOptions = options.sixel ?? {}
   const scale = options.scale ?? 'auto'
   const log = options.log ?? (() => {})
+  const maxCacheBytes = Math.max(0, options.cacheBytes ?? PLACEHOLDER_CACHE_BYTES)
 
   // Terminal state, tracked as it passes.
   let state = GROUND
@@ -239,8 +270,43 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
   let held: Uint8Array | null = null
   let heldPrev: CellInfo | null = null
 
-  const caches = new WeakMap<VirtualPlacement, PlacementCache>()
+  /** Per placement object, least recently drawn first; `cachedBytes` is their total size. */
+  const caches = new Map<VirtualPlacement, PlacementCache>()
+  let cachedBytes = 0
   const unknownLogged = new Set<number>()
+
+  const cacheSize = (cache: PlacementCache): number => cache.scaled.data.length + cache.stripBytes
+
+  const dropCache = (placement: VirtualPlacement): void => {
+    const cache = caches.get(placement)
+    if (cache === undefined) return
+    caches.delete(placement)
+    cachedBytes -= cacheSize(cache)
+  }
+
+  /** Drops the caches of placements the registry no longer holds (deleted or replaced). */
+  const dropStale = (): void => {
+    for (const placement of [...caches.keys()]) {
+      if (registry.lookup(placement.imageId, placement.placementId) !== placement) dropCache(placement)
+    }
+  }
+
+  /**
+   * Keeps the caches within their budget: drops the least recently drawn
+   * other placements first, then `current`'s strips, then `current` itself.
+   */
+  const trimCaches = (current: VirtualPlacement): void => {
+    for (const placement of caches.keys()) {
+      if (cachedBytes <= maxCacheBytes && caches.size <= MAX_CACHED_PLACEMENTS) return
+      if (placement !== current) dropCache(placement)
+    }
+    const cache = caches.get(current)
+    if (cache === undefined || cachedBytes <= maxCacheBytes) return
+    cachedBytes -= cache.stripBytes
+    cache.strips.clear()
+    cache.stripBytes = 0
+    if (cachedBytes > maxCacheBytes) dropCache(current)
+  }
 
   const applySgr = (params: string): void => {
     const parts = params === '' ? [''] : params.split(';')
@@ -334,12 +400,23 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
       return new Uint8Array(n).fill(0x20)
     }
     let cache = caches.get(placement)
-    if (cache === undefined || cache.cellWidth !== cellWidth || cache.cellHeight !== cellHeight) {
+    if (cache !== undefined && (cache.cellWidth !== cellWidth || cache.cellHeight !== cellHeight)) {
+      dropCache(placement)
+      cache = undefined
+    }
+    if (cache === undefined) {
+      dropStale()
       const cell = { width: cellWidth, height: cellHeight }
-      const scaled = scaleToBox(placement.image, columns, rows, cell, scale)
+      // The source rectangle is cut here, only for as long as it takes to scale it.
+      const scaled = scaleToBox(sourceOf(placement), columns, rows, cell, scale)
       // A box too large for the pixel cap is scaled down: cut it by the shrunk cell.
       const cut = placementGeometry(columns, rows, cell).cell
-      cache = { cellWidth, cellHeight, scaled, cut, strips: new Map() }
+      cache = { cellWidth, cellHeight, scaled, cut, strips: new Map(), stripBytes: 0 }
+      caches.set(placement, cache)
+      cachedBytes += scaled.data.length
+    } else {
+      // Most recently drawn last.
+      caches.delete(placement)
       caches.set(placement, cache)
     }
     const key = `${row},${c0},${n}`
@@ -348,9 +425,16 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
       const { x0, x1, y0, y1 } = stripRect(row, c0, n, cache.cut)
       const strip = cropRgba(cache.scaled, x0, y0, x1 - x0, y1 - y0)
       bytes = encodePlaceholderStrip(strip, n, sixelOptions)
-      if (cache.strips.size >= MAX_STRIPS_PER_PLACEMENT) cache.strips.clear()
+      if (cache.strips.size >= MAX_STRIPS_PER_PLACEMENT) {
+        cachedBytes -= cache.stripBytes
+        cache.strips.clear()
+        cache.stripBytes = 0
+      }
       cache.strips.set(key, bytes)
+      cache.stripBytes += bytes.length
+      cachedBytes += bytes.length
     }
+    trimCaches(placement)
     return bytes
   }
 
@@ -571,6 +655,12 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
     flush: () => (held === null ? new Uint8Array(0) : scan(new Uint8Array(0), true)),
     get holding() {
       return held !== null
+    },
+    get cachedBytes() {
+      return cachedBytes
+    },
+    get cachedPlacements() {
+      return caches.size
     },
   }
 }
