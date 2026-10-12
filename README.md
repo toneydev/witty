@@ -29,7 +29,8 @@ powershell -ExecutionPolicy Bypass -File .\witty-0.2.0-win-x64\install.ps1
 
 `install.ps1` copies the folder to `%LOCALAPPDATA%\Programs\witty` and adds it to your user PATH
 (`-Uninstall` reverses both). The zip holds the compiled code and node-pty's prebuilt ConPTY, so the
-only requirement on the machine is Node.js 22.18 or later on PATH.
+only requirement on the machine is Node.js 22.18 or later (`node.exe`) on PATH; the launcher never
+runs a node from the current directory.
 
 ### From source
 
@@ -91,7 +92,7 @@ deletes by screen position. They are accepted and logged.
 
 ```powershell
 npm run typecheck
-npm test                 # 208 tests: protocol, encoder, placeholders, host, and an end-to-end run in a ConPTY
+npm test                 # 247 tests: protocol, encoder, placeholders, host, and an end-to-end run in a ConPTY
 tools\probe-terminal.ps1 # what does this terminal answer to graphics queries?
 ```
 
