@@ -50,6 +50,7 @@ draws pictures with the terminal `Image` element as it would in kitty or Ghostty
 |---|---|
 | `--cell WxH` | cell size in pixels when the terminal does not report it (default 10x20; decimals allowed, e.g. `9.375x20`). witty asks `CSI 14 t` and `CSI 18 t` (exact, fractional) and `CSI 16 t` (rounded) first |
 | `--no-force` | do not set `CLAUDE_CODE_FORCE_TERMINAL_IMAGES` |
+| `--no-inherit-cursor` | start the command's console with its cursor at the top-left. By default witty's ConPTY asks the terminal where its cursor is (`CSI 6 n`) and starts the console there, so Claude Code, which draws from its console cursor row, draws below what the shell left on screen instead of over it |
 | `--no-files` | refuse the file transports (`t=f`, `t=t`); by default witty reads only absolute local regular files, with a size check, a timeout and no file-system oracle (see SECURITY.md) |
 | `--scale auto\|nearest\|smooth` | how images are scaled to their cells. `auto` (default) uses sharp nearest-neighbour when an image is enlarged 2x or more on both axes (pixel art, icons, sprites) and smooth filtering otherwise; `nearest` and `smooth` force one |
 | `--log <file>` | append diagnostics to a file (`--debug` uses `%TEMP%\witty.log`) |

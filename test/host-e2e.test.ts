@@ -163,6 +163,24 @@ describe('witty end to end', { concurrency: true }, () => {
     }
   })
 
+  it('asks the terminal for its cursor position so the child console starts there, unless --no-inherit-cursor', async () => {
+    const { outer, readLog } = startWitty()
+    await outer.waitFor('READY', 30000)
+    assert.ok(outer.output().includes('\x1b[6n'), `no CSI 6 n in ${JSON.stringify(outer.output())}`)
+    outer.write('QUIT')
+    assert.equal(await withTimeout(outer.exited, 15000, 'witty exit'), 42)
+    // The harness answered CSI 1;1 R; the ConPTY consumed it, the child never saw it.
+    assert.ok(!childInput(outer).includes(hex('\x1b[1;1R')), 'the cursor report reached the child')
+    assert.match(readLog(), /inherit cursor true/)
+
+    const off = startWitty({}, ['--no-inherit-cursor'])
+    await off.outer.waitFor('READY', 30000)
+    assert.ok(!off.outer.output().includes('\x1b[6n'), `CSI 6 n in ${JSON.stringify(off.outer.output())}`)
+    off.outer.write('QUIT')
+    assert.equal(await withTimeout(off.outer.exited, 15000, 'witty exit'), 42)
+    assert.match(off.readLog(), /inherit cursor false/)
+  })
+
   it('divides the text area by the console size when CSI 18 t is not answered', async () => {
     const { outer, readLog } = startWitty({ cols: 158, rows: 38, textArea: { width: 1481, height: 760 } })
     await outer.waitFor('READY', 30000)

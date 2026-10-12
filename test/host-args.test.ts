@@ -11,8 +11,15 @@ describe('parseArgs', () => {
     assert.deepEqual(o.args, [])
     assert.deepEqual(o.cell, { width: 10, height: 20 })
     assert.equal(o.force, true)
+    assert.equal(o.inheritCursor, true)
     assert.equal(o.debug, false)
     assert.equal(o.vtInput, 'auto')
+  })
+
+  it('turns cursor inheritance off with --no-inherit-cursor', () => {
+    const o = parseArgs(['--no-inherit-cursor'])
+    assert.equal(o.inheritCursor, false)
+    assert.equal(o.command, 'claude')
   })
 
   it('takes everything from the first non-option token as the command', () => {
