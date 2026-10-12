@@ -4,7 +4,7 @@
 // lets the test type and resize.
 
 import * as nodePty from 'node-pty'
-import { releaseNodePty } from '../../src/host/pty.ts'
+import { releaseNodePty, settleExitCode } from '../../src/host/pty.ts'
 
 export type OuterOptions = {
   cwd?: string
@@ -74,9 +74,12 @@ export function startOuter(file: string, args: string[], options: OuterOptions =
   const exited = new Promise<number>((resolve) => {
     pty.onExit(({ exitCode }) => {
       done = true
-      releaseNodePty(pty)
-      resolve(exitCode)
-      for (const w of waiters) w()
+      // node-pty can fire 'exit' before the native exit code arrives (see settleExitCode).
+      void settleExitCode(pty, exitCode).then((code) => {
+        releaseNodePty(pty)
+        resolve(code)
+        for (const w of waiters) w()
+      })
     })
   })
   return {

@@ -77,6 +77,31 @@ export function spawnChild(options: SpawnChildOptions): ChildPty {
   return wrap(pty, bundled)
 }
 
+/** How long {@link settleExitCode} waits for node-pty's native exit callback. */
+export const EXIT_CODE_SETTLE_MS = 2000
+
+/**
+ * The exit code of a node-pty child whose 'exit' event just fired. On
+ * Windows node-pty emits 'exit' when the conout pipe closes, with whatever
+ * exit code the native side has reported so far; when the pipe closes first
+ * that is `undefined` (seen in CI as a flaky `undefined !== 42`), and a
+ * caller taking it at face value would turn a failed child into exit 0.
+ * The code arrives on the agent moments later, so this polls for it, for
+ * at most {@link EXIT_CODE_SETTLE_MS}, and falls back to 0 only then.
+ * Reaches into node-pty internals (1.2.0-beta), hence the optional chaining.
+ */
+export async function settleExitCode(pty: nodePty.IPty, reported: number | undefined, settleMs = EXIT_CODE_SETTLE_MS): Promise<number> {
+  if (typeof reported === 'number') return reported
+  const agent = (pty as unknown as { _agent?: { exitCode?: number } })._agent
+  const deadline = Date.now() + settleMs
+  while (Date.now() < deadline) {
+    const code = agent?.exitCode
+    if (typeof code === 'number') return code
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  return 0
+}
+
 /**
  * Lets the event loop end after a node-pty child has exited. With
  * `useConptyDll: true` node-pty keeps its conout worker thread (a
@@ -105,9 +130,11 @@ function wrap(pty: nodePty.IPty, bundled: boolean): ChildPty {
   pty.onExit(({ exitCode: code }) => {
     if (exited) return
     exited = true
-    exitCode = code
-    for (const cb of exitListeners) cb(code)
-    releaseNodePty(pty)
+    void settleExitCode(pty, code).then((settled) => {
+      exitCode = settled
+      for (const cb of exitListeners) cb(settled)
+      releaseNodePty(pty)
+    })
   })
   return {
     get pid() {
