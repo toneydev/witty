@@ -17,6 +17,8 @@ export type CliOptions = {
   files: boolean
   /** Set `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` in the child. */
   force: boolean
+  /** Start the child's console at the terminal's cursor position (ConPTY inherit-cursor). */
+  inheritCursor: boolean
   help: boolean
   version: boolean
   /** Hidden: module exporting `createWire` (tests). */
@@ -43,6 +45,11 @@ Options:
   --no-files     refuse kitty file transmissions (t=f, t=t); by default they
                  read only regular files on local drive paths
   --no-force     do not set CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1 for the command
+  --no-inherit-cursor
+                 start the command's console with its cursor at the top-left
+                 instead of where the terminal's cursor is (witty asks with
+                 CSI 6 n); programs that draw from their console cursor row
+                 then paint over what the shell left on screen
   --scale MODE   how images are scaled to their cells: auto (default; sharp
                  nearest-neighbour when enlarged 2x or more, as for pixel art
                  and icons, smooth otherwise), nearest, or smooth
@@ -59,6 +66,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     scale: 'auto',
     files: true,
     force: true,
+    inheritCursor: true,
     help: false,
     version: false,
     wire: undefined,
@@ -111,6 +119,9 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         break
       case '--no-force':
         options.force = false
+        break
+      case '--no-inherit-cursor':
+        options.inheritCursor = false
         break
       case '--help':
       case '-h':

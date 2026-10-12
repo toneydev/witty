@@ -12,6 +12,15 @@ export type SpawnChildOptions = {
   env: Record<string, string | undefined>
   cols: number
   rows: number
+  /**
+   * Start the child's console with the outer terminal's cursor position
+   * (ConPTY's inherit-cursor flag: it asks the terminal with `CSI 6 n` and
+   * waits for the report). Default true. Without it the child's console starts
+   * with its cursor at the top-left while the terminal's is wherever the shell
+   * left it, and a program that draws from its console cursor row (Claude
+   * Code) overwrites what was on screen.
+   */
+  inheritCursor?: boolean
   /** Where the fallback warning goes. Default: process.stderr. */
   warn?: (message: string) => void
   /** node-pty's spawn, injectable for tests. */
@@ -45,6 +54,7 @@ export interface ChildPty {
 export function spawnChild(options: SpawnChildOptions): ChildPty {
   const spawn = options.spawn ?? nodePty.spawn
   const warn = options.warn ?? ((m: string) => process.stderr.write(m + '\n'))
+  const inheritCursor = options.inheritCursor ?? true
   const base = {
     name: 'xterm-256color',
     cols: options.cols,
@@ -55,14 +65,14 @@ export function spawnChild(options: SpawnChildOptions): ChildPty {
   let pty: nodePty.IPty
   let bundled = true
   try {
-    pty = spawn(options.file, options.args, { ...base, useConptyDll: true })
+    pty = spawn(options.file, options.args, { ...base, useConptyDll: true, conptyInheritCursor: inheritCursor })
   } catch (error) {
     warn(
       `witty: the bundled ConPTY failed to start (${(error as Error).message}); ` +
         'falling back to the system ConPTY, kitty images may not pass through.',
     )
     bundled = false
-    pty = spawn(options.file, options.args, { ...base, useConptyDll: false })
+    pty = spawn(options.file, options.args, { ...base, useConptyDll: false, conptyInheritCursor: inheritCursor })
   }
   return wrap(pty, bundled)
 }

@@ -119,9 +119,22 @@ async function main(argv: readonly string[]): Promise<void> {
   if (options.force) env.CLAUDE_CODE_FORCE_TERMINAL_IMAGES = '1'
   const cols = process.stdout.columns || 80
   const rows = process.stdout.rows || 24
-  const spawned = spawnChild({ file: resolved.file, args: resolved.args, cwd: process.cwd(), env, cols, rows })
+  // With inheritCursor the child's ConPTY asks the terminal where its cursor
+  // is (CSI 6 n, forwarded like any output) and starts its console there, so
+  // a program that draws from its console cursor row draws below what the
+  // shell left on screen instead of over it. The report comes back on stdin
+  // and is forwarded like any input.
+  const spawned = spawnChild({
+    file: resolved.file,
+    args: resolved.args,
+    cwd: process.cwd(),
+    env,
+    cols,
+    rows,
+    inheritCursor: options.inheritCursor,
+  })
   child = spawned
-  log(`spawned at ${cols}x${rows}, bundled conpty ${spawned.bundledConpty}`)
+  log(`spawned at ${cols}x${rows}, bundled conpty ${spawned.bundledConpty}, inherit cursor ${options.inheritCursor}`)
   if (learned.leftover.length > 0) spawned.write(learned.leftover)
 
   // Flow control: stop reading the child while stdout is full or while a

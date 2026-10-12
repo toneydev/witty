@@ -17,7 +17,7 @@ pseudo-console that passes the kitty APC sequences through and translating them 
 | Module | Job |
 |---|---|
 | `src/cli.ts` | arguments, environment, wiring |
-| `src/host/pty.ts` | spawn the child in node-pty with `useConptyDll: true`; forward input; resize |
+| `src/host/pty.ts` | spawn the child in node-pty with `useConptyDll: true` and `conptyInheritCursor: true` (see "Two consoles, one cursor"); forward input; resize |
 | `src/host/console.ts` | raw mode on Node 24 already leaves the console input in VT mode (measured: mode 0x208); a hidden PowerShell P/Invoke fallback sets it on older Node |
 | `src/kitty/splitter.ts` | streaming splitter: output bytes → text runs and complete `ESC _ G … ESC \` commands, chunk-safe |
 | `src/kitty/command.ts` | parse `k=v,k=v;payload` into a typed command |
@@ -180,6 +180,24 @@ line carries the helper's stderr and witty goes on without VT input.
 `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` is set unless `--no-force`, because Claude Code only draws
 images for terminals it recognises or when forced. Nothing else is changed: Claude Code still sees
 `WT_SESSION`/`TERM_PROGRAM` and keeps its Windows Terminal behaviour for keys and mouse.
+
+## Two consoles, one cursor
+
+The child has its own console (witty's ConPTY) whose screen buffer starts empty with the cursor at
+the top-left, while the outer terminal still shows what the shell printed, with its cursor below
+that. Claude Code sends no `CSI 6 n`; it reads its cursor row from the Windows console
+(`GetConsoleScreenBufferInfo`) and draws its header from that row with `CSI row;1 H`. Run directly in
+a terminal that row is where the shell left the cursor; under a fresh ConPTY it is 1, so the header
+landed on top of the shell's last lines and, because the renderer places words with `CSI n G` and
+never erases between them, the old text showed through the gaps (seen in Tabby and Windows Terminal
+with 2.1.296).
+
+The child is therefore spawned with node-pty's `conptyInheritCursor` (ConPTY's
+`PSEUDOCONSOLE_INHERIT_CURSOR`): at startup the ConPTY writes `CSI 6 n`, which witty forwards to
+the terminal like any output, the terminal's `CSI row;col R` comes back on stdin and is forwarded like
+any input, and the ConPTY consumes it, sets its cursor there and writes `CSI row;col H` to sync the
+terminal. Measured: Windows Terminal and Tabby answer, and when nothing answers the ConPTY goes on
+after about 100 ms. `--no-inherit-cursor` turns it off.
 
 ## Known risks
 

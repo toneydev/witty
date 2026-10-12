@@ -35,6 +35,8 @@ export type Outer = {
 const ANSWERS: Array<[RegExp, (o: OuterOptions) => string | undefined]> = [
   // DA1: ConPTY asks at startup and waits for the answer.
   [/\x1b\[0?c/g, () => '\x1b[?61;4c'],
+  // DSR 6: the child's ConPTY asks at startup to inherit the cursor position.
+  [/\x1b\[6n/g, () => '\x1b[1;1R'],
   [/\x1b\[16t/g, (o) => (o.cellSize ? `\x1b[6;${o.cellSize.height};${o.cellSize.width}t` : undefined)],
   [/\x1b\[14t/g, (o) => (o.textArea ? `\x1b[4;${o.textArea.height};${o.textArea.width}t` : undefined)],
   [/\x1b\[18t/g, (o) => (o.textCells ? `\x1b[8;${o.textCells.rows};${o.textCells.columns}t` : undefined)],
