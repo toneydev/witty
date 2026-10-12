@@ -12,6 +12,17 @@
 // copied. Colour is filtered premultiplied by alpha so transparent pixels do
 // not bleed their (usually black) colour into the edges of opaque ones, and is
 // un-premultiplied on output.
+//
+// Cost. The source is untrusted and need not resemble the box: a decoded image
+// may be up to 64 MiB of RGBA in any shape (say 256 × 65536), and only the
+// destination is capped (src/term/emit.ts). The two passes commute, so the
+// first pass is whichever axis gives the smaller intermediate, min(dw × sh,
+// sw × dh) float pixels, never their cross product (8 GiB for 256 × 65536 into
+// 8192 × 20 if the horizontal pass always ran first). That minimum is at most
+// max(sw × sh, dw × dh), so scratch memory stays within 4x the larger of the
+// source and destination RGBA bytes (16-byte float pixels), and the work within
+// a small multiple of their pixel counts. The source is premultiplied as each
+// pixel is read, not copied whole.
 
 import type { Rgba, ScaleMode } from '../types.ts'
 
@@ -107,19 +118,19 @@ export function resizeRgba(image: Rgba, width: number, height: number, options: 
   }
   if (resolveScaleMode(options.mode ?? 'auto', sw, sh, dw, dh) === 'nearest') return nearest(image, dw, dh)
 
-  // Premultiplied float copy of the source.
-  const pre = new Float32Array(sw * sh * 4)
-  for (let p = 0; p < sw * sh * 4; p += 4) {
-    const a = src[p + 3]!
-    const k = a / 255
-    pre[p] = src[p]! * k
-    pre[p + 1] = src[p + 1]! * k
-    pre[p + 2] = src[p + 2]! * k
-    pre[p + 3] = a
-  }
-
-  // Horizontal pass: sw × sh → dw × sh.
   const hx = axisTaps(sw, dw)
+  const vy = axisTaps(sh, dh)
+  const out = new Uint8Array(dw * dh * 4)
+  // The intermediate holds the first pass's output: dw × sh horizontal-first,
+  // sw × dh vertical-first. Take the smaller (ties keep horizontal-first).
+  if (sw * dh < dw * sh) verticalFirst(src, sw, dw, dh, hx, vy, out)
+  else horizontalFirst(src, sw, sh, dw, dh, hx, vy, out)
+  return { width: dw, height: dh, data: out }
+}
+
+/** Smooth, horizontal pass first: sw × sh → dw × sh → dw × dh. */
+function horizontalFirst(src: Uint8Array, sw: number, sh: number, dw: number, dh: number, hx: Taps, vy: Taps, out: Uint8Array): void {
+  // Horizontal pass: sw × sh → dw × sh, premultiplying source pixels as they are read.
   const mid = new Float32Array(dw * sh * 4)
   for (let y = 0; y < sh; y++) {
     const srow = y * sw * 4
@@ -133,10 +144,12 @@ export function resizeRgba(image: Rgba, width: number, height: number, options: 
       for (let k = hx.offset[x]!; k < end; k++) {
         const s = srow + hx.index[k]! * 4
         const w = hx.weight[k]!
-        r += pre[s]! * w
-        g += pre[s + 1]! * w
-        b += pre[s + 2]! * w
-        a += pre[s + 3]! * w
+        const sa = src[s + 3]!
+        const m = sa / 255
+        r += Math.fround(src[s]! * m) * w
+        g += Math.fround(src[s + 1]! * m) * w
+        b += Math.fround(src[s + 2]! * m) * w
+        a += sa * w
       }
       const d = drow + x * 4
       mid[d] = r
@@ -147,8 +160,6 @@ export function resizeRgba(image: Rgba, width: number, height: number, options: 
   }
 
   // Vertical pass: dw × sh → dw × dh, un-premultiplied into bytes.
-  const vy = axisTaps(sh, dh)
-  const out = new Uint8Array(dw * dh * 4)
   const rowStride = dw * 4
   for (let y = 0; y < dh; y++) {
     const start = vy.offset[y]!
@@ -168,17 +179,70 @@ export function resizeRgba(image: Rgba, width: number, height: number, options: 
         b += mid[s + 2]! * w
         a += mid[s + 3]! * w
       }
-      const d = drow + col
-      const ab = Math.round(a)
-      if (ab <= 0) continue // fully transparent: leave 0,0,0,0
-      const k = 255 / a
-      out[d] = clamp(Math.round(r * k))
-      out[d + 1] = clamp(Math.round(g * k))
-      out[d + 2] = clamp(Math.round(b * k))
-      out[d + 3] = ab > 255 ? 255 : ab
+      unpremultiply(out, drow + col, r, g, b, a)
     }
   }
-  return { width: dw, height: dh, data: out }
+}
+
+/** Smooth, vertical pass first: sw × sh → sw × dh → dw × dh. */
+function verticalFirst(src: Uint8Array, sw: number, dw: number, dh: number, hx: Taps, vy: Taps, out: Uint8Array): void {
+  // Vertical pass: sw × sh → sw × dh, premultiplying source pixels as they are
+  // read. Each output row sums its source rows into `acc` front to back, so
+  // both are read in memory order.
+  const rowStride = sw * 4
+  const mid = new Float32Array(rowStride * dh)
+  const acc = new Float64Array(rowStride)
+  for (let y = 0; y < dh; y++) {
+    acc.fill(0)
+    const end = vy.offset[y + 1]!
+    for (let k = vy.offset[y]!; k < end; k++) {
+      const srow = vy.index[k]! * rowStride
+      const w = vy.weight[k]!
+      for (let p = 0; p < rowStride; p += 4) {
+        const s = srow + p
+        const sa = src[s + 3]!
+        const m = sa / 255
+        acc[p]! += Math.fround(src[s]! * m) * w
+        acc[p + 1]! += Math.fround(src[s + 1]! * m) * w
+        acc[p + 2]! += Math.fround(src[s + 2]! * m) * w
+        acc[p + 3]! += sa * w
+      }
+    }
+    mid.set(acc, y * rowStride)
+  }
+
+  // Horizontal pass: sw × dh → dw × dh, un-premultiplied into bytes.
+  for (let y = 0; y < dh; y++) {
+    const srow = y * rowStride
+    const drow = y * dw * 4
+    for (let x = 0; x < dw; x++) {
+      let r = 0
+      let g = 0
+      let b = 0
+      let a = 0
+      const end = hx.offset[x + 1]!
+      for (let k = hx.offset[x]!; k < end; k++) {
+        const s = srow + hx.index[k]! * 4
+        const w = hx.weight[k]!
+        r += mid[s]! * w
+        g += mid[s + 1]! * w
+        b += mid[s + 2]! * w
+        a += mid[s + 3]! * w
+      }
+      unpremultiply(out, drow + x * 4, r, g, b, a)
+    }
+  }
+}
+
+/** Writes premultiplied float r, g, b, a (alpha 0..255) to `out[d..d+3]` as straight-alpha bytes. */
+function unpremultiply(out: Uint8Array, d: number, r: number, g: number, b: number, a: number): void {
+  const ab = Math.round(a)
+  if (ab <= 0) return // fully transparent: leave 0,0,0,0
+  const k = 255 / a
+  out[d] = clamp(Math.round(r * k))
+  out[d + 1] = clamp(Math.round(g * k))
+  out[d + 2] = clamp(Math.round(b * k))
+  out[d + 3] = ab > 255 ? 255 : ab
 }
 
 /** Nearest-neighbour scaling: destination pixel i reads source pixel floor((i + 0.5) * src / dst). */

@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { resizeRgba, resolveScaleMode } from '../src/image/resize.ts'
-import { make, pixel, solid } from './helpers/images.ts'
+import type { Rgba } from '../src/types.ts'
+import { make, pixel, rng, solid } from './helpers/images.ts'
 
 const checker = (w: number, h: number, size = 1) =>
   make(w, h, (x, y) => ((Math.floor(x / size) + Math.floor(y / size)) % 2 === 0 ? [0, 0, 0, 255] : [255, 255, 255, 255]))
@@ -129,4 +130,166 @@ test('auto picks nearest at 2x or more on both axes, smooth otherwise', () => {
   assert.deepEqual(resizeRgba(sprite, 16, 8), resizeRgba(sprite, 16, 8, { mode: 'nearest' }))
   assert.deepEqual(resizeRgba(sprite, 12, 6, { mode: 'auto' }), resizeRgba(sprite, 12, 6, { mode: 'smooth' }))
   assert.notDeepEqual(resizeRgba(sprite, 12, 6, { mode: 'smooth' }), resizeRgba(sprite, 12, 6, { mode: 'nearest' }))
+})
+
+/**
+ * The smooth path as it was before the pass order became adaptive: a full
+ * premultiplied Float32 copy of the source, the horizontal pass always first.
+ * A reference for the pixels only; its intermediate is dw x sh.
+ */
+function horizontalFirstReference(image: Rgba, dw: number, dh: number): Rgba {
+  const { width: sw, height: sh, data: src } = image
+  const taps = (n: number, m: number) => {
+    const out: [number, number][][] = []
+    const scale = n / m
+    for (let i = 0; i < m; i++) {
+      const t: [number, number][] = []
+      if (m === n) t.push([i, 1])
+      else if (m < n) {
+        const lo = i * scale
+        const hi = Math.min(n, (i + 1) * scale)
+        for (let j = Math.floor(lo); j < Math.ceil(hi); j++) {
+          const overlap = Math.min(hi, j + 1) - Math.max(lo, j)
+          if (overlap > 1e-9) t.push([j, overlap / scale])
+        }
+      } else {
+        const x = (i + 0.5) * scale - 0.5
+        if (x <= 0) t.push([0, 1])
+        else if (x >= n - 1) t.push([n - 1, 1])
+        else t.push([Math.floor(x), 1 - (x - Math.floor(x))], [Math.floor(x) + 1, x - Math.floor(x)])
+      }
+      out.push(t)
+    }
+    return out
+  }
+  const pre = new Float32Array(sw * sh * 4)
+  for (let p = 0; p < sw * sh * 4; p += 4) {
+    const k = src[p + 3]! / 255
+    pre[p] = src[p]! * k
+    pre[p + 1] = src[p + 1]! * k
+    pre[p + 2] = src[p + 2]! * k
+    pre[p + 3] = src[p + 3]!
+  }
+  const hx = taps(sw, dw)
+  const mid = new Float32Array(dw * sh * 4)
+  for (let y = 0; y < sh; y++) {
+    for (let x = 0; x < dw; x++) {
+      for (const [j, w] of hx[x]!) for (let c = 0; c < 4; c++) mid[(y * dw + x) * 4 + c]! += pre[(y * sw + j) * 4 + c]! * w
+    }
+  }
+  const vy = taps(sh, dh)
+  const out = new Uint8Array(dw * dh * 4)
+  for (let y = 0; y < dh; y++) {
+    for (let x = 0; x < dw; x++) {
+      const v = [0, 0, 0, 0]
+      for (const [j, w] of vy[y]!) for (let c = 0; c < 4; c++) v[c]! += mid[(j * dw + x) * 4 + c]! * w
+      const a = Math.round(v[3]!)
+      if (a <= 0) continue
+      const d = (y * dw + x) * 4
+      for (let c = 0; c < 3; c++) out[d + c] = Math.max(0, Math.min(255, Math.round((v[c]! * 255) / v[3]!)))
+      out[d + 3] = Math.min(255, a)
+    }
+  }
+  return { width: dw, height: dh, data: out }
+}
+
+/** Asserts every channel of `actual` is within 1 of `expected`. */
+function assertClose(actual: Rgba, expected: Rgba, label: string) {
+  assert.deepEqual([actual.width, actual.height], [expected.width, expected.height], label)
+  for (let p = 0; p < expected.data.length; p++) {
+    const diff = Math.abs(actual.data[p]! - expected.data[p]!)
+    if (diff > 1) {
+      const i = p >> 2
+      assert.fail(`${label}: pixel ${i % expected.width},${Math.floor(i / expected.width)} channel ${p & 3}: ${actual.data[p]} vs ${expected.data[p]}`)
+    }
+  }
+}
+
+/** Random colour and alpha, with some fully transparent and fully opaque pixels. */
+function noise(w: number, h: number, seed: number): Rgba {
+  const r = rng(seed)
+  return make(w, h, () => {
+    const t = r()
+    const a = t < 0.15 ? 0 : t < 0.5 ? 255 : Math.floor(r() * 256)
+    return [Math.floor(r() * 256), Math.floor(r() * 256), Math.floor(r() * 256), a]
+  })
+}
+
+test('smooth output does not depend on which axis is filtered first', () => {
+  // Each pair is the same scaling both ways round: the cheaper pass order is
+  // horizontal-first for one and vertical-first for the other.
+  const shapes: [number, number, number, number][] = [
+    [40, 30, 5, 20], // shrink both
+    [30, 40, 20, 5],
+    [5, 4, 13, 31], // grow both
+    [4, 5, 31, 13],
+    [40, 8, 6, 30], // shrink one, grow the other
+    [8, 40, 30, 6],
+    [33, 17, 33, 4], // one axis unchanged
+    [17, 33, 4, 33],
+    [16, 4096, 512, 5], // the tall-source shape, small enough for the reference
+  ]
+  let seed = 1
+  for (const [sw, sh, dw, dh] of shapes) {
+    const src = noise(sw, sh, seed++)
+    const label = `${sw}x${sh} -> ${dw}x${dh}`
+    assertClose(resizeRgba(src, dw, dh, { mode: 'smooth' }), horizontalFirstReference(src, dw, dh), label)
+  }
+})
+
+/**
+ * Runs `f` while watching every Float32Array and Float64Array built; one asking
+ * for more than `limit` elements throws before it is allocated. Returns the
+ * largest seen.
+ */
+function largestFloatArray(limit: number, f: () => void): number {
+  const saved32 = globalThis.Float32Array
+  const saved64 = globalThis.Float64Array
+  let largest = 0
+  const handler: ProxyHandler<Float32ArrayConstructor | Float64ArrayConstructor> = {
+    construct(target, args) {
+      const n = typeof args[0] === 'number' ? args[0] : (args[0] as ArrayLike<number>).length
+      if (n > limit) throw new RangeError(`a ${n}-element ${target.name} exceeds ${limit}`)
+      largest = Math.max(largest, n)
+      return Reflect.construct(target, args)
+    },
+  }
+  globalThis.Float32Array = new Proxy(saved32, handler) as Float32ArrayConstructor
+  globalThis.Float64Array = new Proxy(saved64, handler) as Float64ArrayConstructor
+  try {
+    f()
+  } finally {
+    globalThis.Float32Array = saved32
+    globalThis.Float64Array = saved64
+  }
+  return largest
+}
+
+test('scratch memory is bounded by the larger of source and destination, not their product', () => {
+  // A 256x65536 source (64 MiB, a small zlib payload) placed in an 8192x20 box:
+  // filtering horizontally first would need an 8192x65536 float intermediate
+  // (8 GiB). Rows are identical, so the box-filtered column is the row itself
+  // and the result is that row stretched, on every output row.
+  const row = make(256, 1, (x) => [x, 255 - x, (x * 7) & 255, x < 16 ? 0 : 128 + (x >> 1)])
+  for (const transpose of [false, true]) {
+    const [sw, sh, dw, dh] = transpose ? [65536, 256, 20, 8192] : [256, 65536, 8192, 20]
+    const data = new Uint8Array(sw * sh * 4)
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < sw; x++) data.set(row.data.subarray((transpose ? y : x) * 4, (transpose ? y : x) * 4 + 4), (y * sw + x) * 4)
+    }
+    const label = `${sw}x${sh} -> ${dw}x${dh}`
+    let out: Rgba | undefined
+    const largest = largestFloatArray(4 * Math.max(sw * sh, dw * dh), () => {
+      out = resizeRgba({ width: sw, height: sh, data }, dw, dh)
+    })
+    assert.ok(largest < sw * sh, `${label}: no float copy of the whole source (largest ${largest})`)
+    const line = transpose
+      ? horizontalFirstReference({ width: 1, height: 256, data: row.data }, 1, 8192)
+      : horizontalFirstReference(row, 8192, 1)
+    const expected = new Uint8Array(dw * dh * 4)
+    for (let y = 0; y < dh; y++) {
+      for (let x = 0; x < dw; x++) expected.set(line.data.subarray((transpose ? y : x) * 4, (transpose ? y : x) * 4 + 4), (y * dw + x) * 4)
+    }
+    assertClose(out!, { width: dw, height: dh, data: expected }, label)
+  }
 })
