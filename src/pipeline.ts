@@ -11,7 +11,7 @@
 // command before it): `virtual` and `delete` events keep the registry of
 // virtual placements the pass draws placeholder cells from.
 
-import type { ApcSplitter, CellSize, EngineEvent, KittyCommand, KittyEngine, PlaceEmitter, PlaceholderPass, ScaleMode, SplitItem } from './types.ts'
+import type { ApcSplitter, CellSize, EngineEvent, KittyCommand, KittyEngine, PlaceEmitter, PlaceholderPass, ScaleMode, ScreenSize, SplitItem } from './types.ts'
 import { printable } from './kitty/command.ts'
 import { VirtualPlacements, createPlaceholderPass } from './term/placeholders.ts'
 
@@ -21,6 +21,8 @@ export type PipelineOptions = {
   emitter: PlaceEmitter
   /** Current cell size, read at each placement. */
   cellSize: () => CellSize
+  /** The outer terminal's size in cells, read at each placement (placements are clipped to it). */
+  screen?: () => ScreenSize
   /**
    * Writes to the outer terminal. May return a promise (e.g. resolving on
    * 'drain'); later output then waits for it, so nothing is dropped or
@@ -188,7 +190,7 @@ export function createPipeline(options: PipelineOptions): Pipeline {
     switch (event.kind) {
       case 'place': {
         log(`place image ${event.imageId} ${event.image.width}x${event.image.height} in ${event.columns}x${event.rows} cells, cursor ${event.cursor}`)
-        await writeOut(emitter(event, cellSize()))
+        await writeOut(emitter(event, cellSize(), options.screen?.()))
         break
       }
       case 'virtual':

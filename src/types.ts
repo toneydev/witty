@@ -175,4 +175,11 @@ export type SixelOptions = {
 export type PlaceEmitter = (
   event: Extract<EngineEvent, { kind: 'place' }>,
   cell: CellSize,
+  screen?: ScreenSize,
 ) => Uint8Array
+
+/** The outer terminal's size in cells (0 when unknown). */
+export type ScreenSize = {
+  columns: number
+  rows: number
+}
