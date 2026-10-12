@@ -1,0 +1,38 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - name: Check the tag matches package.json
+        shell: pwsh
+        run: |
+          $v = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ("v$v" -ne $env:GITHUB_REF_NAME) { throw "tag $env:GITHUB_REF_NAME but package.json is $v" }
+      - name: Pack the portable release
+        shell: pwsh
+        run: pwsh tools/pack-release.ps1
+      - name: Smoke test the zip
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem release/*.zip | Select-Object -First 1
+          Expand-Archive $zip.FullName -DestinationPath "$env:RUNNER_TEMP/witty-smoke"
+          $out = & "$env:RUNNER_TEMP/witty-smoke/witty.cmd" --version
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch '^witty \d') { throw "witty.cmd --version gave '$out'" }
+          $out
+      - name: Publish the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME (Get-ChildItem release/*.zip).FullName --title $env:GITHUB_REF_NAME --generate-notes

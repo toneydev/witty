@@ -1,17 +1,38 @@
 {
   "name": "witty",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Hosts a program in a passthrough ConPTY and translates its kitty graphics into sixel, so images show in Windows Terminal and Tabby.",
   "type": "module",
   "license": "MIT",
   "author": "Kyle Toney",
-  "repository": { "type": "git", "url": "https://github.com/toneydev/witty.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/toneydev/witty.git"
+  },
   "homepage": "https://github.com/toneydev/witty#readme",
-  "bugs": { "url": "https://github.com/toneydev/witty/issues" },
-  "keywords": ["kitty", "graphics", "sixel", "conpty", "windows-terminal", "tabby", "claude-code"],
-  "files": ["dist", "README.md", "LICENSE"],
-  "bin": { "witty": "dist/cli.js" },
-  "engines": { "node": ">=22.18" },
+  "bugs": {
+    "url": "https://github.com/toneydev/witty/issues"
+  },
+  "keywords": [
+    "kitty",
+    "graphics",
+    "sixel",
+    "conpty",
+    "windows-terminal",
+    "tabby",
+    "claude-code"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "witty": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc -p . --noEmit",
