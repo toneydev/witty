@@ -33,10 +33,13 @@ const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
  * pixels (default `f=32`); `o=z` zlib-inflates the data first; `t=d` (the
  * default) means the payload is the base64 data, `t=f` / `t=t` that it is the
  * base64 of a file path, read through `options.readFile` honoring `O`
- * (offset) and `S` (size); every file failure is `EBADF:Failed to read image
- * file`. A `t=t` file is offered to `options.deleteFile` after the read
- * attempt only when its basename contains `tty-graphics-protocol` (the
- * deleter applies the rest of the policy, see files.ts). `t=s` is refused.
+ * (offset) and `S` (size). Once the medium is a file, every failure (path,
+ * read, range, inflate, PNG, raw size) is `EBADF:Failed to read image file`,
+ * so the response says nothing about the file beyond whether it decoded as
+ * the image the command describes. A `t=t` file is offered to
+ * `options.deleteFile` after the read attempt only when its basename contains
+ * `tty-graphics-protocol` (the deleter applies the rest of the policy, see
+ * files.ts). `t=s` is refused.
  *
  * Throws `KittyError` with the response code for every failure. Messages are
  * fixed strings: nothing from the command is echoed back.
@@ -57,36 +60,36 @@ export async function decodeImage(
     throw new KittyError('EINVAL', 'unsupported compression')
   }
 
-  let data = await readData(keys, payload, options, maxPayloadBytes, maxImageBytes)
-  if (compression === 'z') data = inflate(data, maxImageBytes)
-  if (format === '100') return decodePng(data, maxImageBytes)
-  return decodeRaw(data, format === '24' ? 3 : 4, keys, maxImageBytes)
-}
+  const decode = (transmitted: Uint8Array): Rgba => {
+    const data = compression === 'z' ? inflate(transmitted, maxImageBytes) : transmitted
+    if (format === '100') return decodePng(data, maxImageBytes)
+    return decodeRaw(data, format === '24' ? 3 : 4, keys, maxImageBytes)
+  }
 
-/** The transmitted bytes, before decompression, from the medium `t` names. */
-async function readData(
-  keys: Record<string, string>,
-  payload: string,
-  options: DecodeOptions,
-  maxPayloadBytes: number,
-  maxImageBytes: number,
-): Promise<Uint8Array> {
   const medium = keys.t === undefined || keys.t === '' ? 'd' : keys.t
   switch (medium) {
     case 'd':
-      if (payload.length > maxPayloadBytes) {
-        throw new KittyError('EFBIG', `payload of ${payload.length} bytes exceeds ${maxPayloadBytes}`)
-      }
-      return base64(payload)
+      if (payload.length > maxPayloadBytes) throw new KittyError('EFBIG', 'payload too large')
+      return decode(base64(payload))
     case 'f':
-    case 't':
-      return readFileData(medium, keys, payload, options, maxImageBytes)
+    case 't': {
+      const file = await readFileData(medium, keys, payload, options, maxImageBytes)
+      // A decode error would tell the child that the file exists, its size
+      // (ENODATA) or something of its content: it gets the read failure instead.
+      try {
+        return decode(file)
+      } catch {
+        throw fileReadFailed()
+      }
+    }
     case 's':
       throw new KittyError('EINVAL', 'shared memory transmission is not supported')
     default:
       throw new KittyError('EINVAL', 'unsupported transmission medium')
   }
 }
+
+const fileReadFailed = (): KittyError => new KittyError('EBADF', FILE_READ_FAILED)
 
 /** The last path component, for either separator. */
 function basenameOf(p: string): string {
@@ -105,17 +108,22 @@ async function readFileData(
   if (readFile === undefined) {
     throw new KittyError('EINVAL', 'file transmission is not supported')
   }
-  const offset = uintKey(keys, 'O')
-  const size = uintKey(keys, 'S')
-  const failed = () => new KittyError('EBADF', FILE_READ_FAILED)
+  let offset: number
+  let size: number
+  try {
+    offset = uintKey(keys, 'O')
+    size = uintKey(keys, 'S')
+  } catch {
+    throw fileReadFailed()
+  }
   const path = Buffer.from(payload, 'base64').toString('utf8')
-  if (path === '' || path.includes('\0')) throw failed()
+  if (path === '' || path.includes('\0')) throw fileReadFailed()
 
   let file: Uint8Array
   try {
     file = await readFile(path, { offset, size, maxBytes: maxImageBytes })
   } catch {
-    throw failed()
+    throw fileReadFailed()
   } finally {
     // kitty's safety rule, tightened: only a file clearly named as a graphics
     // temp file is offered for deletion; the deleter also requires it to be
@@ -125,7 +133,7 @@ async function readFileData(
     }
   }
   if (file.length > maxImageBytes || offset > file.length || (size > 0 && offset + size > file.length)) {
-    throw failed()
+    throw fileReadFailed()
   }
   return file.subarray(offset, size > 0 ? offset + size : file.length)
 }
@@ -143,7 +151,7 @@ function inflate(data: Uint8Array, limit: number): Uint8Array {
       return new Uint8Array(out.buffer, out.byteOffset, out.length)
     } catch (error) {
       if (error instanceof RangeError || (error as { code?: unknown }).code === 'ERR_BUFFER_TOO_LARGE') {
-        return new KittyError('EFBIG', `inflated data exceeds ${limit} bytes`)
+        return new KittyError('EFBIG', 'inflated data too large')
       }
       return new KittyError('EINVAL', 'Failed to inflate image data')
     }
@@ -160,7 +168,7 @@ function checkSize(width: number, height: number, maxImageBytes: number): void {
   if (width === 0 || height === 0) throw new KittyError('EINVAL', 'zero width or height is not allowed')
   const bytes = width * height * 4
   if (bytes > maxImageBytes) {
-    throw new KittyError('EFBIG', `image of ${width}x${height} exceeds ${maxImageBytes} bytes of RGBA`)
+    throw new KittyError('EFBIG', 'image too large')
   }
 }
 
@@ -194,7 +202,7 @@ function decodeRaw(data: Uint8Array, bpp: 3 | 4, keys: Record<string, string>, m
   const pixels = width * height
   const needed = pixels * bpp
   if (data.length < needed) {
-    throw new KittyError('ENODATA', `Insufficient image data: ${data.length} < ${needed}`)
+    throw new KittyError('ENODATA', 'Insufficient image data')
   }
   if (bpp === 4) return { width, height, data: data.slice(0, needed) }
   const rgba = new Uint8Array(pixels * 4)

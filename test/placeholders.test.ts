@@ -385,3 +385,62 @@ describe('placeholder pass', () => {
     assert.equal(t.pass.push(chunk), chunk)
   })
 })
+
+describe('placeholder pass: bounded memory', () => {
+  /** A pass over `registry` whose caches hold at most `cacheBytes`. */
+  function bounded(registry: VirtualPlacements, cacheBytes?: number) {
+    const pass = createPlaceholderPass({ registry, cellSize: () => CELL, ...(cacheBytes === undefined ? {} : { cacheBytes }) })
+    const run = (s: string): string => latin1(concat([pass.push(enc.encode(s)), pass.flush()]))
+    return { pass, run }
+  }
+  /** Two cells of image `id` (a 256-colour or a 24-bit foreground). */
+  const cellsOf = (id: number): string => `\x1b[38;2;${(id >> 16) & 255};${(id >> 8) & 255};${id & 255}m${row(0, 2)}x`
+
+  it('cuts the source rectangle out of the shared image only when it draws the placement', () => {
+    const image = cellImage(4, 1) // 16x6
+    const registry = new VirtualPlacements()
+    registry.set({ ...placement(42, image, 2, 1), source: { x: 4, y: 0, width: 8, height: 6 } })
+    const found = strips(bounded(registry).run(cellsOf(42)))
+    assert.equal(found.length, 1)
+    assertPixels(found[0]!.image, cropRgba(image, 4, 0, 8, 6))
+  })
+
+  it('the caches of all placements share one byte budget, least recently drawn dropped first', () => {
+    const registry = new VirtualPlacements()
+    const images = Array.from({ length: 10 }, (_, k) => cellImage(2, 1, k * 3))
+    images.forEach((image, k) => registry.set(placement(k + 1, image, 2, 1)))
+    // One 2x1-cell box at 4x6 is 192 bytes of RGBA, plus its strip: room for two.
+    const budget = 2 * (192 + 120)
+    const t = bounded(registry, budget)
+    for (let k = 0; k < 10; k++) {
+      assert.equal(strips(t.run(cellsOf(k + 1))).length, 1)
+      assert.ok(t.pass.cachedBytes > 0 && t.pass.cachedBytes <= budget, `after ${k + 1}: ${t.pass.cachedBytes} bytes`)
+    }
+    assert.ok(t.pass.cachedPlacements <= 2, `${t.pass.cachedPlacements} placements cached`)
+    // A dropped cache is rebuilt, with the same pixels.
+    assertPixels(strips(t.run(cellsOf(1)))[0]!.image, images[0]!)
+  })
+
+  it('the number of cached placements is bounded too', () => {
+    const registry = new VirtualPlacements()
+    for (let id = 1; id <= 300; id++) registry.set(placement(id, cellImage(2, 1, id), 2, 1))
+    const t = bounded(registry)
+    for (let id = 1; id <= 300; id++) t.run(cellsOf(id))
+    assert.ok(t.pass.cachedPlacements <= 256, `${t.pass.cachedPlacements} placements cached`)
+  })
+
+  it('the cache of a replaced or deleted placement is dropped when the next one is built', () => {
+    const registry = new VirtualPlacements()
+    registry.set(placement(42, cellImage(2, 1, 0), 2, 1))
+    const t = bounded(registry)
+    t.run(cellsOf(42))
+    assert.equal(t.pass.cachedPlacements, 1)
+    registry.set(placement(42, cellImage(2, 1, 7), 2, 1))
+    t.run(cellsOf(42))
+    assert.equal(t.pass.cachedPlacements, 1)
+    registry.set(placement(43, cellImage(2, 1, 9), 2, 1))
+    registry.delete([42])
+    t.run(cellsOf(43))
+    assert.equal(t.pass.cachedPlacements, 1)
+  })
+})

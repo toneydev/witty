@@ -18,17 +18,18 @@ pseudo-console that passes the kitty APC sequences through and translating them 
 |---|---|
 | `src/cli.ts` | arguments, environment, wiring |
 | `src/host/pty.ts` | spawn the child in node-pty with `useConptyDll: true` and `conptyInheritCursor: true` (see "Two consoles, one cursor"); forward input; resize |
+| `src/host/resolve.ts` | find the command on PATH (never the current directory); run `.cmd`/`.bat` through `cmd.exe` with arguments quoted so cmd cannot run them (see "Security") |
 | `src/host/console.ts` | raw mode on Node 24 already leaves the console input in VT mode (measured: mode 0x208); a hidden PowerShell P/Invoke fallback sets it on older Node |
 | `src/kitty/splitter.ts` | streaming splitter: output bytes → text runs and complete `ESC _ G … ESC \` commands, chunk-safe |
 | `src/kitty/command.ts` | parse `k=v,k=v;payload` into a typed command |
 | `src/kitty/engine.ts` | the interpreter: image store, chunk accumulation (`m=1`), transmit / put / delete / query, responses |
 | `src/kitty/decode.ts` | payload → RGBA: PNG (`f=100`), raw `f=24`/`f=32`, `o=z` inflate, `t=d` direct, `t=f`/`t=t` file |
 | `src/kitty/files.ts` | the file transport policy: which paths may be read (and `t=t` files deleted), uniform errors, timeout |
-| `src/image/resize.ts` | scale to the target pixel box: nearest-neighbour or smooth (box / bilinear), `auto` picks |
+| `src/image/resize.ts` | scale to the target pixel box, or only its top-left region: nearest-neighbour or smooth (box / bilinear), `auto` picks |
 | `src/sixel/quantize.ts` | median cut to ≤255 colors plus a transparent index |
 | `src/sixel/encode.ts` | RGBA → sixel DCS string |
 | `src/term/metrics.ts` | learn the (fractional) cell size: `CSI 14 t` / `CSI 18 t`, else `CSI 16 t`, else `--cell` |
-| `src/term/emit.ts` | wrap a placement: save cursor, sixel, restore cursor, move per kitty's cursor policy; encode a placeholder strip |
+| `src/term/emit.ts` | wrap a placement (clipped to the screen, cached): save cursor, sixel, restore cursor, move per kitty's cursor policy; encode a placeholder strip |
 | `src/term/placeholders.ts` | the unicode placeholder pass over outgoing text, and the registry of virtual placements |
 | `src/term/diacritics.ts` | kitty's row/column diacritic table (`rowcolumn-diacritics.txt`, 297 code points) |
 | `src/image/crop.ts` | cut a pixel rectangle out of an image (transparent outside it) |
@@ -46,11 +47,20 @@ ESC 7   DCS q … ST   ESC 8   CSI (rows-1) B   CSI (cols) C
 The image box is `c`×`r` cells when given (scaled to fill, as Claude Code's `Image` does), else
 `ceil(width / cellW)` × `ceil(height / cellH)`.
 
+A placement is clipped to the screen as kitty clips it at the screen edge: with a known terminal
+size, only the top-left `min(c, screen columns)` × `min(r, screen rows)` cells are scaled
+(`resizeRegion`, the same filter taps as the whole box) and encoded, so one put never costs more
+than a screenful of sixel; the cursor still moves past the whole box. Encoded placements are cached
+per source image (an uncropped `a=p` reuses the stored image) under box, cell size, visible cells
+and cursor policy, LRU within 32 MiB, so repeated puts reuse their bytes.
+
 Scaling policy (`--scale`, default `auto`): `nearest` copies the source pixel under each target
 pixel's centre, `smooth` filters (box when shrinking, bilinear when growing, alpha premultiplied),
 and `auto` uses nearest when the image grows 2x or more on both axes and smooth otherwise. Small
 sprites and icons (an 8x4 sprite in a 72x38 box, say) stay sharp; downscaled photos and small
-enlargements stay smooth. The same policy applies to normal placements (`createPlaceEmitter`) and
+enlargements stay smooth. Smooth filtering runs the axis that gives the smaller intermediate first,
+so scratch memory stays within a small multiple of the larger of source and destination, whatever
+the source's shape (a 256x65536 image in an 8192x20 box once asked for 8 GiB). The same policy applies to normal placements (`createPlaceEmitter`) and
 to virtual placements (the placeholder pass scales the whole box once, then cuts strips from it).
 
 `a=d` deletes: the cells of every matching placement are overwritten with spaces (sixel has no
@@ -99,10 +109,13 @@ The strip's pixels: the placement's image scaled once to `round(columns*cellW)` 
 `round(rows*cellH)` (filling the box, like a normal placement; Claude Code picks `c`/`r` from the
 aspect ratio), cropped to `x = round(c0*cellW) .. round((c0+n)*cellW)`,
 `y = round(row*cellH) .. round((row+1)*cellH)`. The cell size may be fractional (see "Cell size"),
-and rounding the boundaries rather than the size keeps neighbouring strips tiled. Cache: per virtual placement object (a
-`WeakMap`), the scaled image for the current cell size and the encoded strips keyed by
-(row, c0, n). A replaced or deleted placement is a different or unreachable object, so its cache goes
-with it; a new cell size rebuilds it.
+and rounding the boundaries rather than the size keeps neighbouring strips tiled. A `virtual` event
+carries the stored image itself plus its source rectangle (`x,y,w,h`), never a copy; the rectangle
+is cut only while the cache is built, and the cut is dropped after scaling. Cache: per virtual
+placement, the scaled image for the current cell size and the encoded strips keyed by (row, c0, n),
+least recently drawn first within one 128 MiB budget across all placements (scaled images and
+strips counted) and at most 256 placements; a new cell size rebuilds it, and the caches of replaced
+or deleted placements are dropped when the next one is built.
 
 Chunk safety: escape sequences are parsed by a streaming state machine (their bytes are never held),
 OSC/DCS/APC strings are skipped. Only a trailing partial U+10EEEE and a run whose last cell may still
@@ -149,8 +162,10 @@ the payload, so `src/kitty/files.ts` enforces a policy before the engine sees an
 - The read (`FileHandle.readFile` with `AbortSignal.timeout(2000)`), together with the checks, is
   raced against a 2 s timer, so a stalled volume (a mapped network drive, say) errors instead of
   freezing the pipeline.
-- Every failure gives exactly one status, `EBADF:Failed to read image file`, with no detail, so
-  the response says nothing about whether a path exists, how large it is or whether it is readable.
+- Every failure, including decoding a file that was read (inflate, PNG, raw size, a malformed
+  `O`/`S`), gives exactly one status, `EBADF:Failed to read image file`, with no detail, so the
+  response says nothing about whether a path exists, how large it is or whether it is readable.
+  Only a file that decodes as the image the command describes is answered OK, as in kitty.
 - A `t=t` file is deleted only when the resolved path lies inside `os.tmpdir()` (resolved, and
   `path.relative` neither starting with `..` nor absolute) and its basename contains
   `tty-graphics-protocol`. Nothing else is ever deleted, whether or not the decode succeeds.
@@ -165,7 +180,12 @@ image (normal placements in `emit.ts`, virtual ones in `placeholders.ts`) is cap
 side and 16,777,216 pixels in area. A larger box is scaled down proportionally, and the image then
 draws smaller than its cells. For a virtual placement the strips are cut with a matching smaller
 cell, so they still tile. Decoded images are capped at 64 MiB of RGBA, payloads at 32 MiB, and the
-image store at 256 MiB (LRU).
+image store at 256 MiB and 4096 images (LRU; storing an image costs constant time while the store
+fits). No command walks the store: images are indexed by number (the newest with each `I`), by
+id in order (for `d=r`/`d=R` ranges) and by whether anything references them (for `d=a`/`d=A`). At most 4096 virtual placements are kept (past that the oldest is dropped, with a log line
+and a `delete`), and 1024 distinct placement ids per image (the rest are only counted, so the image
+stays referenced). The placeholder caches share 128 MiB and the encoded placement cache 32 MiB. A
+normal placement costs at most one screenful of sixel per put (see "Placement semantics").
 
 **The console-mode helper** (`host/console.ts`, only on Node < 24 or `--vt-input always`) starts
 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` by absolute path, never by a PATH
@@ -174,6 +194,22 @@ P/Invoke calls with Reflection.Emit rather than Add-Type, so no C# compiler runs
 written; on a cold CI runner, Add-Type compiling with csc ran past the old 10 s timeout. The timeout
 is now 30 s (`WITTY_CONSOLE_HELPER_TIMEOUT_MS` overrides it), and a failure is never fatal: the log
 line carries the helper's stderr and witty goes on without VT input.
+
+**The child command** (`host/resolve.ts`) is looked up in the `PATH` directories only, never the
+current directory. A `.cmd`/`.bat` file (npm's `claude.cmd`) runs as
+`cmd.exe /d /e:on /v:off /s /c ""<file>" <args>"`, with `ComSpec` or else
+`%SystemRoot%\System32\cmd.exe`. cmd parses the arguments twice, once on that line and again where
+the batch file expands `%*`, so they are quoted the way Rust does since CVE-2024-24576: anything
+outside `[A-Za-z0-9#$*+-./:?@\_]` is quoted per the MSVC rules with an embedded `"` written `""`
+(cmd's quote state never flips, so `&|<>^()` stay quoted on both passes, and node.exe reads `""` as
+one `"`), each `%` becomes `%%cd:~,%` (nothing can pair up into `%name%`), and `/v:off` keeps `!`
+literal. An argument holding CR, LF or NUL cannot be carried through cmd and is refused. A batch
+file that turns on delayed expansion itself, or re-parses `%1` carelessly, is beyond any quoting.
+
+**The portable launcher** (`witty.cmd`) finds `node.exe` with `%~$PATH:I`, which searches the
+`PATH` directories only: a bare `node` (or `where node`) would let cmd.exe run a `node.exe`,
+`node.cmd` or `node.bat` planted in the current directory, even when witty was started from
+PowerShell. It starts node with the caller's environment unchanged.
 
 ## Environment of the child
 

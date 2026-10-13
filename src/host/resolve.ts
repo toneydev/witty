@@ -11,7 +11,8 @@ export type ResolvedCommand = {
   file: string
   /**
    * The arguments: an argv array (node-pty quotes it per the MSVC rules), or,
-   * for batch files run through `cmd.exe`, a pre-escaped command line string.
+   * for batch files run through `cmd.exe`, a pre-escaped command line string
+   * (node-pty appends it to the quoted `file` and hands it to CreateProcess as is).
    */
   args: string[] | string
   /** The file the user's command resolved to (the `.cmd` itself for batch files). */
@@ -88,20 +89,42 @@ export function findExecutable(name: string, options: ResolveOptions = {}): stri
   return undefined
 }
 
-// cmd.exe metacharacters, escaped with `^` (the cross-spawn rules).
-const CMD_META = /([()\][%!^"`<>&|;, *?])/g
+// What an argument may hold and still go to a batch file unquoted (Rust's set, ASCII only).
+const BATCH_PLAIN = /^[A-Za-z0-9#$*+\-./:?@\\_]+$/
 
-/** Quotes one argument per the MSVC rules, then `^`-escapes it for cmd.exe. */
-export function escapeCmdArgument(arg: string): string {
-  let quoted = arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, '$1$1')
-  quoted = `"${quoted}"`
-  return quoted.replace(CMD_META, '^$1')
+/**
+ * `%` becomes `%%cd:~,%`: cmd keeps the first `%` and expands `%cd:~,%` (an
+ * empty substring of the current directory) to nothing, so no `%name%` in the
+ * argument can ever pair up and expand.
+ */
+function neutralizePercents(text: string): string {
+  return text.replace(/%/g, '%%cd:~,%')
+}
+
+/**
+ * Quotes one argument for a batch file run through `cmd.exe`, which parses it
+ * twice: once on our command line and again where the batch file expands `%*`
+ * (as npm's shims do). The Rust approach (CVE-2024-24576): quote anything not
+ * plainly safe, per the MSVC rules but with `"` doubled to `""`, so cmd's
+ * quote state never flips inside the argument and `&|<>^()` stay quoted on
+ * both passes; MSVC programs (node.exe) read `""` inside quotes as one `"`.
+ * Throws for CR, LF and NUL, which no quoting can carry through cmd.
+ */
+export function escapeBatchArgument(arg: string): string {
+  if (/[\r\n\0]/.test(arg)) {
+    throw new Error(`witty: cannot pass an argument with a line break or NUL to a batch file: ${JSON.stringify(arg)}`)
+  }
+  if (BATCH_PLAIN.test(arg)) return arg
+  const quoted = arg.replace(/(\\*)"/g, '$1$1""').replace(/(\\*)$/, '$1$1')
+  return `"${neutralizePercents(quoted)}"`
 }
 
 /**
  * Resolves `command` with `args` for node-pty. `.cmd`/`.bat` files are run
- * as `cmd.exe /d /s /c "<file> <args>"` with cmd-escaped arguments; anything
- * else is started directly. Throws when the command cannot be found.
+ * as `cmd.exe /d /e:on /v:off /s /c ""<file>" <args>"` with batch-escaped
+ * arguments (command extensions on for the `%` neutralizing, delayed
+ * expansion off so `!` stays literal); anything else is started directly.
+ * Throws when the command cannot be found or an argument cannot be passed.
  */
 export function resolveCommand(command: string, args: string[], options: ResolveOptions = {}): ResolvedCommand {
   const env = options.env ?? process.env
@@ -111,9 +134,12 @@ export function resolveCommand(command: string, args: string[], options: Resolve
   }
   const ext = path.win32.extname(found).toLowerCase()
   if (ext === '.cmd' || ext === '.bat') {
-    const comspec = getEnv(env, 'ComSpec') ?? 'cmd.exe'
-    const line = [escapeCmdArgument(found), ...args.map(escapeCmdArgument)].join(' ')
-    return { file: comspec, args: `/d /s /c "${line}"`, resolved: found }
+    // Absolute, so a bare `cmd.exe` is never looked up in the current directory.
+    const systemRoot = getEnv(env, 'SystemRoot') || getEnv(env, 'windir') || 'C:\\Windows'
+    const comspec = getEnv(env, 'ComSpec') || path.win32.join(systemRoot, 'System32', 'cmd.exe')
+    // File names cannot hold `"`, so quoting the path needs only the `%` treatment.
+    const line = [`"${neutralizePercents(found)}"`, ...args.map(escapeBatchArgument)].join(' ')
+    return { file: comspec, args: `/d /e:on /v:off /s /c "${line}"`, resolved: found }
   }
   return { file: found, args, resolved: found }
 }

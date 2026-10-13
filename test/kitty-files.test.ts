@@ -152,7 +152,7 @@ describe('t=t deletion', () => {
     // A failed decode deletes nothing outside the rule either.
     const outsideTemp = write(path.join(outside, 'tty-graphics-protocol-x.png'), Uint8Array.of(0))
     const bad = await engine.handle(parseKittyCommand(`a=T,t=t,f=100,i=1;${b64(outsideTemp)}`))
-    assert.match(responses(bad)[0] ?? '', /EBADPNG/)
+    assert.deepEqual(responses(bad), [FAILED])
     assert.ok(existsSync(outsideTemp))
   })
 })
@@ -175,6 +175,26 @@ describe('engine with the real file access', () => {
     for (const body of cases) assert.deepEqual(responses(await engine.handle(parseKittyCommand(body))), [FAILED], body)
     const limited = createEngine({ cellSize: () => ({ width: 10, height: 20 }), maxImageBytes: 1024, ...createFileAccess() })
     assert.deepEqual(responses(await limited.handle(parseKittyCommand(`a=T,t=f,f=32,s=1,v=1,i=1;${b64(big)}`))), [FAILED])
+  })
+
+  it('answers a file that reads but does not decode exactly like a missing one', async () => {
+    const engine = createEngine({ cellSize: () => ({ width: 10, height: 20 }), ...createFileAccess({ tmpdir: tmp }) })
+    const text = write(path.join(outside, 'text.txt'), new Uint8Array(12345).fill(0x61))
+    const missing = path.join(outside, 'no-such-file.txt')
+    const notZlib = write(path.join(outside, 'not-zlib.bin'), Buffer.from('garbage'))
+    const cases = [
+      `a=t,t=f,f=100,i=1;${b64(text)}`, // not a PNG (EBADPNG)
+      `a=t,t=f,f=100,i=1;${b64(missing)}`, // the read fails
+      `a=t,t=f,f=32,s=1000,v=1000,i=1;${b64(text)}`, // too short: ENODATA, which echoed the size
+      `a=t,t=f,f=32,s=1,v=1,o=z,i=1;${b64(notZlib)}`, // inflate fails (EINVAL)
+      `a=t,t=f,f=32,s=100000,v=100000,i=1;${b64(text)}`, // larger than the image limit (EFBIG)
+      `a=t,t=f,f=32,s=0,v=1,i=1;${b64(text)}`, // zero width (EINVAL)
+      `a=t,t=f,f=32,s=1,v=1,O=x,i=1;${b64(text)}`, // malformed offset (EINVAL)
+    ]
+    for (const body of cases) assert.deepEqual(responses(await engine.handle(parseKittyCommand(body))), [FAILED], body)
+    // The same bytes inline do fail to inflate, so the o=z case above is an inflate failure.
+    const inline = await engine.handle(parseKittyCommand(`a=t,f=32,s=1,v=1,o=z,i=1;${b64('garbage')}`))
+    assert.match(responses(inline)[0] ?? '', /^\x1b_Gi=1;EINVAL:/)
   })
 
   it('--no-files: the wire refuses both transports with EINVAL; by default it reads', async () => {

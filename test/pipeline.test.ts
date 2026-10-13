@@ -3,6 +3,7 @@
 
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { createEngine } from '../src/kitty/engine.ts'
 import { createPipeline } from '../src/pipeline.ts'
 import type { ApcSplitter, EngineEvent, KittyCommand, KittyEngine, PlaceEmitter, SplitItem } from '../src/types.ts'
 
@@ -353,5 +354,48 @@ describe('pipeline: unicode placeholders', { concurrency: true }, () => {
     assert.equal(t.out.join(''), atEnd)
     assert.equal(atEnd.match(/\x1bP/g)?.length, 1)
     assert.ok(!t.logs.some((l) => l.includes('idle')))
+  })
+})
+
+describe('pipeline: virtual placements with the real engine', () => {
+  const PH = '\u{10EEEE}'
+  /** Row 0, columns 0 and 1 of image 42, placement `p` (the underline colour). */
+  const cellsOf = (p: number): string => `\x1b[38;5;42;58;5;${p}m${PH}\u{305}\u{305}${PH}\u{305}\u{30D}\x1b[0m`
+  const command = (keys: Record<string, string>, payload = ''): SplitItem => ({ kind: 'apc', command: { keys, payload } })
+
+  it('a dropped virtual placement stops drawing; the rest draw their source rectangle', async () => {
+    const out: string[] = []
+    // A 4x1 image: red, green, blue, white.
+    const rgba = Uint8Array.of(255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255)
+    const put = (p: number, x: number): SplitItem => command({ a: 'p', U: '1', i: '42', p: String(p), x: String(x), w: '2', c: '2', r: '1', q: '2' })
+    const items = [
+      command({ a: 't', f: '32', s: '4', v: '1', i: '42', q: '2' }, Buffer.from(rgba).toString('base64')),
+      put(1, 0),
+      put(2, 0),
+      put(3, 2), // over the bound of 2: placement 1 is dropped
+      text(`<1>${cellsOf(1)}<3>${cellsOf(3)}<end>`),
+    ]
+    const pipeline = createPipeline({
+      splitter: scriptedSplitter([items]),
+      engine: createEngine({ cellSize: () => ({ width: 1, height: 1 }), maxVirtualPlacements: 2 }),
+      emitter,
+      cellSize: () => ({ width: 1, height: 1 }),
+      writeOut: (bytes) => {
+        out.push(dec.decode(bytes))
+      },
+      writeChild: () => {},
+      idleFlushMs: 0,
+    })
+    await pipeline.feed(enc.encode('x'))
+    await pipeline.end()
+    const all = out.join('')
+    const one = all.slice(all.indexOf('<1>') + 3, all.indexOf('<3>'))
+    const three = all.slice(all.indexOf('<3>') + 3, all.indexOf('<end>'))
+    assert.equal(one, cellsOf(1), 'placement 1 was dropped: its cells pass through')
+    assert.ok(!three.includes(PH) && three.includes('\x1bP'), JSON.stringify(three))
+    // Pixels x=2..3 of the image: blue then white (sixel colours are percentages).
+    assert.match(three, /#\d+;2;0;0;100#/)
+    assert.match(three, /#\d+;2;100;100;100#/)
+    assert.doesNotMatch(three, /;2;(100;0;0|0;100;0)#/, 'no red or green from outside the rectangle')
   })
 })

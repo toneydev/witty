@@ -22,10 +22,17 @@ What witty guarantees:
   sanitised to printable ASCII, and ids are validated integers.
 - File transport (`t=f`, `t=t`) reads only absolute, local, regular files, never UNC paths, device
   names, pipes, symlinks or directories; checks the size before reading; times out; reports every
-  failure with one identical status so nothing about the file system leaks; and deletes a temp file
+  failure, including a file that reads but does not decode, with one identical status so nothing
+  about the file system leaks; and deletes a temp file
   only inside the OS temp directory under kitty's naming rule. `--no-files` turns it off entirely.
-- Memory and CPU are bounded: payloads, decoded images, the image store, placement boxes, held
-  bytes and caches all have caps, and zlib and PNG decoding are capped before decompression.
+- Memory and CPU are bounded: payloads, decoded images, the image store (bytes and image count),
+  virtual placements, placement boxes, scaling scratch memory, held bytes and caches all have caps,
+  zlib and PNG decoding are capped before decompression, a placement draws at most a screenful,
+  and no single command walks the whole image store.
+- Nothing is run from the current directory: the child command and the portable launcher's
+  `node.exe` are found on `PATH` only, and `cmd.exe` by absolute path. Arguments to a `.cmd`/`.bat`
+  child (npm's `claude.cmd`) are quoted so cmd.exe cannot run any part of them as a command;
+  arguments holding CR, LF or NUL are refused for batch children.
 - The pseudo-console is Microsoft's own: node-pty's bundled `conpty.dll` and `OpenConsole.exe` are
   Authenticode-signed by Microsoft Corporation.
 
@@ -41,4 +48,5 @@ What witty does not protect against:
 ## Supply chain
 
 Dependencies are pinned in `package-lock.json` with integrity hashes. Install with `npm ci`.
-`npm audit` is clean at the time of writing. Dependabot watches npm and GitHub Actions.
+`npm audit` is clean at the time of writing. Dependabot watches npm and GitHub Actions. Workflow actions are pinned to
+commit SHAs.

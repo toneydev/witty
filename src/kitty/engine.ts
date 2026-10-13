@@ -1,6 +1,6 @@
 // The kitty graphics interpreter: image store, chunk accumulation, actions, responses.
 
-import type { EngineEvent, KittyCommand, KittyEngine, KittyEngineOptions, Rgba, VirtualPlacementKey } from '../types.ts'
+import type { EngineEvent, KittyCommand, KittyEngine, KittyEngineOptions, Rgba, SourceRect, VirtualPlacementKey } from '../types.ts'
 import { KittyError, encodeResponse, printable, uintKey } from './command.ts'
 import type { ResponseFields } from './command.ts'
 import { DEFAULT_MAX_IMAGE_BYTES, DEFAULT_MAX_PAYLOAD_BYTES, decodeImage } from './decode.ts'
@@ -8,6 +8,24 @@ import { cropRgba as crop } from '../image/crop.ts'
 
 /** Default bound on stored image data (RGBA bytes) before LRU eviction. */
 export const DEFAULT_MAX_STORE_BYTES = 256 * 1024 * 1024
+
+/**
+ * Default bound on the number of stored images before LRU eviction. Each
+ * costs about a kilobyte besides its pixels, which the byte bound does not
+ * see: tiny images would otherwise pile up by the hundred thousand.
+ */
+export const DEFAULT_MAX_IMAGES = 4096
+
+/**
+ * Default bound on virtual placements, over all images; past it the oldest
+ * is dropped. Each holds no pixels (only the stored image and its box), so
+ * this bounds the bookkeeping; the placeholder pass's caches have their own
+ * byte budget.
+ */
+export const DEFAULT_MAX_VIRTUAL_PLACEMENTS = 4096
+
+/** Default bound on the distinct placement ids (`p`) told apart per image. */
+export const DEFAULT_MAX_PLACEMENT_IDS = 1024
 
 /** The actions of the protocol (for naming one in a log line). */
 const KNOWN_ACTIONS = new Set(['t', 'T', 'q', 'p', 'd', 'f', 'a', 'c'])
@@ -19,6 +37,12 @@ export const MAX_PLACEMENT_CELLS = 1024
 export type EngineOptions = KittyEngineOptions & {
   /** Stored RGBA bytes beyond which least recently used images are evicted. Default 256 MiB. */
   maxStoreBytes?: number
+  /** Stored images beyond which least recently used ones are evicted. Default {@link DEFAULT_MAX_IMAGES}. */
+  maxImages?: number
+  /** Virtual placements beyond which the oldest is dropped. Default {@link DEFAULT_MAX_VIRTUAL_PLACEMENTS}. */
+  maxVirtualPlacements?: number
+  /** Placement ids told apart per image. Default {@link DEFAULT_MAX_PLACEMENT_IDS}. */
+  maxPlacementIds?: number
 }
 
 /** Placement keys that witty cannot honor; each is logged once when seen. */
@@ -32,11 +56,13 @@ type StoredImage = {
   /** The client's image number (`I`), if it was transmitted with one. */
   number: number
   rgba: Rgba
-  /** Transmission order, to find the newest image with a number. */
-  seq: number
-  /** Named placements (`p`). */
+  /** The previous image transmitted with the same number, if any. */
+  older: StoredImage | undefined
+  /** The next image transmitted with the same number (none for the newest). */
+  newer: StoredImage | undefined
+  /** Named placements (`p`), at most `maxPlacementIds` of them. */
   placements: Set<number>
-  /** Placements without a `p`. */
+  /** Placements without a `p`, and named ones past the bound (only cleared together). */
   anonymousPlacements: number
   /**
    * Virtual placements (`U=1`) by placement id (0 for none), with the keys
@@ -47,6 +73,11 @@ type StoredImage = {
 
 /** The placement keys a virtual placement keeps (source rectangle and box). */
 const BOX_KEYS = ['x', 'y', 'w', 'h', 'c', 'r'] as const
+
+/** A virtual placement in the engine-wide creation order. */
+type VirtualEntry = { image: StoredImage; p: number }
+
+const virtualKey = (id: number, p: number): string => `${id}:${p}`
 
 /** A chunked transmission (`m=1`) being accumulated. */
 type Loading = {
@@ -76,10 +107,24 @@ export class Engine implements KittyEngine {
   readonly #maxImageBytes: number
   readonly #maxPayloadBytes: number
   readonly #maxStoreBytes: number
+  readonly #maxImages: number
+  readonly #maxVirtual: number
+  readonly #maxPlacementIds: number
   /** Images in least-recently-used order (oldest first). */
   readonly #images = new Map<number, StoredImage>()
+  /** Every virtual placement of every stored image, oldest first. */
+  readonly #virtualOrder = new Map<string, VirtualEntry>()
+  /** The stored images with normal placements. */
+  readonly #placed = new Set<StoredImage>()
+  /** The newest stored image with each number (`I`); older ones chain through `older`. */
+  readonly #byNumber = new Map<number, StoredImage>()
+  /** The ids of all stored images, for `d=R`. */
+  readonly #ids = new SortedIds()
+  /** The ids of stored images with any placement, normal or virtual, for `d=r`. */
+  readonly #referenced = new SortedIds()
+  /** The stored images without any placement, for `d=A`. */
+  readonly #unreferenced = new Set<StoredImage>()
   #storeBytes = 0
-  #seq = 0
   #nextId = FIRST_ALLOCATED_ID
   #loading: Loading | null = null
   readonly #logged = new Set<string>()
@@ -89,6 +134,9 @@ export class Engine implements KittyEngine {
     this.#maxImageBytes = options.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES
     this.#maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
     this.#maxStoreBytes = options.maxStoreBytes ?? DEFAULT_MAX_STORE_BYTES
+    this.#maxImages = Math.max(1, options.maxImages ?? DEFAULT_MAX_IMAGES)
+    this.#maxVirtual = Math.max(1, options.maxVirtualPlacements ?? DEFAULT_MAX_VIRTUAL_PLACEMENTS)
+    this.#maxPlacementIds = Math.max(0, options.maxPlacementIds ?? DEFAULT_MAX_PLACEMENT_IDS)
   }
 
   async handle(command: KittyCommand): Promise<EngineEvent[]> {
@@ -130,7 +178,7 @@ export class Engine implements KittyEngine {
     if (loading.error !== null) return
     loading.length += payload.length
     if (loading.length > this.#maxPayloadBytes) {
-      loading.error = new KittyError('EFBIG', `payload exceeds ${this.#maxPayloadBytes} bytes`)
+      loading.error = new KittyError('EFBIG', 'payload too large')
       loading.payload = []
       return
     }
@@ -194,13 +242,16 @@ export class Engine implements KittyEngine {
       id,
       number,
       rgba,
-      seq: ++this.#seq,
+      older: undefined,
+      newer: undefined,
       placements: new Set(),
       anonymousPlacements: 0,
       virtual: new Map(),
     }
     this.#images.set(id, image)
     this.#storeBytes += rgba.data.length
+    if (number !== 0) this.#linkNumber(image)
+    this.#sync(image)
     // Virtual placements outlive a replacement: they show the new pixels.
     if (carried !== undefined) {
       for (const [p, boxKeys] of carried) {
@@ -264,11 +315,15 @@ export class Engine implements KittyEngine {
       return
     }
     const { source, columns, rows } = this.#box(image.rgba, keys)
-    if (p !== 0) image.placements.add(p)
+    // Past the bound a named placement is only counted: the image then stays
+    // referenced until all its placements go (d=i without p, d=a).
+    if (p !== 0 && (image.placements.has(p) || image.placements.size < this.#maxPlacementIds)) image.placements.add(p)
     else image.anonymousPlacements++
+    this.#placed.add(image)
+    this.#sync(image)
     events.push({
       kind: 'place',
-      image: source,
+      image: source === undefined ? image.rgba : crop(image.rgba, source.x, source.y, source.width, source.height),
       columns,
       rows,
       cursor: keys.C === '1' ? 'stay' : 'move',
@@ -276,7 +331,12 @@ export class Engine implements KittyEngine {
     })
   }
 
-  /** Records (or replaces) virtual placement `p` of `image` and emits its `virtual` event. */
+  /**
+   * Records (or replaces) virtual placement `p` of `image` and emits its
+   * `virtual` event. The event carries the stored image and the source
+   * rectangle, never a copy: the placeholder pass cuts it out when drawing.
+   * Past the bound on virtual placements the oldest one is dropped.
+   */
   #placeVirtual(events: EngineEvent[], image: StoredImage, keys: Record<string, string>, p: number): void {
     const { source, columns, rows } = this.#box(image.rgba, keys)
     const boxKeys: Record<string, string> = {}
@@ -284,23 +344,54 @@ export class Engine implements KittyEngine {
       const value = keys[key]
       if (value !== undefined) boxKeys[key] = value
     }
+    const key = virtualKey(image.id, p)
+    this.#virtualOrder.delete(key)
+    if (this.#virtualOrder.size >= this.#maxVirtual) this.#dropOldestVirtual(events)
     image.virtual.set(p, boxKeys)
+    this.#virtualOrder.set(key, { image, p })
+    this.#sync(image)
     events.push({
       kind: 'virtual',
       imageId: image.id,
       placementId: p !== 0 ? p : undefined,
-      image: source,
+      image: image.rgba,
+      ...(source === undefined ? {} : { source }),
       columns,
       rows,
     })
   }
 
+  /** Drops the oldest virtual placement, to bound their number. */
+  #dropOldestVirtual(events: EngineEvent[]): void {
+    for (const { image, p } of this.#virtualOrder.values()) {
+      const removed: VirtualPlacementKey[] = []
+      this.#forgetVirtual(image, removed, p)
+      events.push({ kind: 'log', message: `virtual placement ${p} of image ${image.id} dropped: over ${this.#maxVirtual} virtual placements` })
+      events.push(this.#deleteEvent([image.id], removed))
+      return
+    }
+  }
+
+  /** Forgets virtual placement `p` of `image` (every one when `p` is undefined), adding what was removed to `removed`. */
+  #forgetVirtual(image: StoredImage, removed: VirtualPlacementKey[], p?: number): void {
+    if (image.virtual.size === 0) return
+    const forget = (key: number): void => {
+      if (!image.virtual.delete(key)) return
+      this.#virtualOrder.delete(virtualKey(image.id, key))
+      removed.push({ imageId: image.id, placementId: key !== 0 ? key : undefined })
+    }
+    if (p !== undefined) forget(p)
+    else for (const key of image.virtual.keys()) forget(key)
+    this.#sync(image)
+  }
+
   /**
-   * The source rectangle (`x,y,w,h`) of `rgba` and the cell box (`c`,`r`) a
-   * placement with `keys` covers: both given, as is; one given, the other
-   * from the aspect ratio; neither, the source's size in cells.
+   * The source rectangle (`x,y,w,h`) of `rgba` (undefined for the whole
+   * image) and the cell box (`c`,`r`) a placement with `keys` covers: both
+   * given, as is; one given, the other from the aspect ratio; neither, the
+   * source's size in cells.
    */
-  #box(rgba: Rgba, keys: Record<string, string>): { source: Rgba; columns: number; rows: number } {
+  #box(rgba: Rgba, keys: Record<string, string>): { source: SourceRect | undefined; columns: number; rows: number } {
     const x = uintKey(keys, 'x')
     const y = uintKey(keys, 'y')
     const w = uintKey(keys, 'w')
@@ -312,7 +403,8 @@ export class Engine implements KittyEngine {
     }
     const width = Math.min(w === 0 ? rgba.width : w, rgba.width - x)
     const height = Math.min(h === 0 ? rgba.height : h, rgba.height - y)
-    const source = crop(rgba, x, y, width, height)
+    const whole = x === 0 && y === 0 && width === rgba.width && height === rgba.height
+    const source = whole ? undefined : { x, y, width, height }
 
     const cell = this.#options.cellSize()
     const cellWidth = cell.width > 0 ? cell.width : 1
@@ -346,11 +438,14 @@ export class Engine implements KittyEngine {
         // kitty: d=a/A leaves virtual placements alone (only i, I, n, N, r, R
         // delete them), and an image they still reference is not freed.
         const ids: number[] = []
-        for (const image of [...this.#images.values()]) {
-          if (hasPlacements(image)) ids.push(image.id)
-          clearPlacements(image)
-          if (free && image.virtual.size === 0) this.#remove(image)
+        // Only images with placements are visited, and for d=A the images left
+        // without any, which are all freed: a flood of d=a/A must not walk the
+        // store. Removing the entry being visited is safe while iterating a Set.
+        for (const image of this.#placed) {
+          ids.push(image.id)
+          this.#clearPlacements(image)
         }
+        if (free) for (const image of this.#unreferenced) this.#remove(image)
         events.push(this.#deleteEvent(ids, []))
         return
       }
@@ -367,7 +462,9 @@ export class Engine implements KittyEngine {
       case 'r': {
         const from = uintKey(keys, 'x')
         const to = uintKey(keys, 'y')
-        const images = [...this.#images.values()].filter((image) => image.id >= from && image.id <= to)
+        // d=r touches only images with placements; d=R frees the rest of the
+        // range too. Each looks up just the ids in the range, never the store.
+        const images = (free ? this.#ids : this.#referenced).range(from, to).map((id) => this.#images.get(id)!)
         if (images.length > 0) this.#deletePlacements(events, images, 0, free)
         return
       }
@@ -397,11 +494,12 @@ export class Engine implements KittyEngine {
     for (const image of images) {
       if (p !== 0) {
         image.placements.delete(p)
-        if (image.virtual.delete(p)) removed.push({ imageId: image.id, placementId: p })
+        if (!hasPlacements(image)) this.#placed.delete(image)
+        this.#forgetVirtual(image, removed, p)
+        this.#sync(image)
       } else {
-        clearPlacements(image)
-        for (const key of image.virtual.keys()) removed.push({ imageId: image.id, placementId: key !== 0 ? key : undefined })
-        image.virtual.clear()
+        this.#clearPlacements(image)
+        this.#forgetVirtual(image, removed)
       }
       if (free && !isReferenced(image)) this.#remove(image)
     }
@@ -419,11 +517,39 @@ export class Engine implements KittyEngine {
   }
 
   #newestWithNumber(number: number): StoredImage | undefined {
-    let newest: StoredImage | undefined
-    for (const image of this.#images.values()) {
-      if (image.number === number && (newest === undefined || image.seq > newest.seq)) newest = image
+    return this.#byNumber.get(number)
+  }
+
+  /** Makes `image` the newest with its number. */
+  #linkNumber(image: StoredImage): void {
+    const newest = this.#byNumber.get(image.number)
+    if (newest !== undefined) {
+      newest.newer = image
+      image.older = newest
     }
-    return newest
+    this.#byNumber.set(image.number, image)
+  }
+
+  /** Takes `image` out of the chain of images with its number. */
+  #unlinkNumber(image: StoredImage): void {
+    const { older, newer } = image
+    if (older !== undefined) older.newer = newer
+    if (newer !== undefined) newer.older = older
+    else if (older !== undefined) this.#byNumber.set(image.number, older)
+    else this.#byNumber.delete(image.number)
+    image.older = image.newer = undefined
+  }
+
+  /** Brings the id indexes and the unreferenced set in step with `image`. */
+  #sync(image: StoredImage): void {
+    const stored = this.#images.get(image.id) === image
+    const referenced = stored && isReferenced(image)
+    if (stored) this.#ids.add(image.id)
+    else this.#ids.delete(image.id)
+    if (referenced) this.#referenced.add(image.id)
+    else this.#referenced.delete(image.id)
+    if (stored && !referenced) this.#unreferenced.add(image)
+    else this.#unreferenced.delete(image)
   }
 
   #allocateId(): number {
@@ -439,16 +565,40 @@ export class Engine implements KittyEngine {
     this.#images.set(image.id, image)
   }
 
+  /**
+   * Drops `image` from the store. Its virtual placements leave the creation
+   * order; its `virtual` map is left for a replacement to carry over.
+   */
   #remove(image: StoredImage): void {
     if (this.#images.get(image.id) !== image) return
     this.#images.delete(image.id)
     this.#storeBytes -= image.rgba.data.length
+    this.#placed.delete(image)
+    for (const p of image.virtual.keys()) this.#virtualOrder.delete(virtualKey(image.id, p))
+    if (image.number !== 0) this.#unlinkNumber(image)
+    this.#sync(image)
   }
 
-  /** Evicts least recently used images (never `keep`) until the store fits its bound. */
+  #clearPlacements(image: StoredImage): void {
+    image.placements.clear()
+    image.anonymousPlacements = 0
+    this.#placed.delete(image)
+    this.#sync(image)
+  }
+
+  #overBudget(): boolean {
+    return this.#storeBytes > this.#maxStoreBytes || this.#images.size > this.#maxImages
+  }
+
+  /**
+   * Evicts least recently used images (never `keep`) until the store fits its
+   * bounds. Constant time while it fits: nothing is walked or copied.
+   */
   #evict(keep: number, events: EngineEvent[]): void {
-    for (const image of [...this.#images.values()]) {
-      if (this.#storeBytes <= this.#maxStoreBytes) return
+    if (!this.#overBudget()) return
+    // Deleting the entry being visited is safe while iterating a Map.
+    for (const image of this.#images.values()) {
+      if (!this.#overBudget()) return
       if (image.id === keep) continue
       this.#remove(image)
       events.push({ kind: 'log', message: `evicted image ${image.id} to bound image memory` })
@@ -492,6 +642,40 @@ export class Engine implements KittyEngine {
   }
 }
 
+/** A set of image ids kept in order, so a range of them is found without a walk. */
+class SortedIds {
+  readonly #ids: number[] = []
+
+  add(id: number): void {
+    const k = this.#lowerBound(id)
+    if (this.#ids[k] !== id) this.#ids.splice(k, 0, id)
+  }
+
+  delete(id: number): void {
+    const k = this.#lowerBound(id)
+    if (this.#ids[k] === id) this.#ids.splice(k, 1)
+  }
+
+  /** The ids from `from` to `to`, inclusive, in order. */
+  range(from: number, to: number): number[] {
+    const found: number[] = []
+    for (let k = this.#lowerBound(from); k < this.#ids.length && this.#ids[k]! <= to; k++) found.push(this.#ids[k]!)
+    return found
+  }
+
+  /** The index of the first id not below `id`. */
+  #lowerBound(id: number): number {
+    let low = 0
+    let high = this.#ids.length
+    while (low < high) {
+      const mid = (low + high) >>> 1
+      if (this.#ids[mid]! < id) low = mid + 1
+      else high = mid
+    }
+    return low
+  }
+}
+
 function isTransmit(action: string | undefined): boolean {
   return action === undefined || action === '' || action === 't' || action === 'T' || action === 'q' || action === 'f'
 }
@@ -503,11 +687,6 @@ function hasPlacements(image: StoredImage): boolean {
 /** Whether anything, a normal or a virtual placement, still uses the image. */
 function isReferenced(image: StoredImage): boolean {
   return hasPlacements(image) || image.virtual.size > 0
-}
-
-function clearPlacements(image: StoredImage): void {
-  image.placements.clear()
-  image.anonymousPlacements = 0
 }
 
 /** Creates a kitty graphics engine (see `Engine`). */

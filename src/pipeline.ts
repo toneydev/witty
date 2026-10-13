@@ -11,7 +11,7 @@
 // command before it): `virtual` and `delete` events keep the registry of
 // virtual placements the pass draws placeholder cells from.
 
-import type { ApcSplitter, CellSize, EngineEvent, KittyCommand, KittyEngine, PlaceEmitter, PlaceholderPass, ScaleMode, SplitItem } from './types.ts'
+import type { ApcSplitter, CellSize, EngineEvent, KittyCommand, KittyEngine, PlaceEmitter, PlaceholderPass, ScaleMode, ScreenSize, SplitItem } from './types.ts'
 import { printable } from './kitty/command.ts'
 import { VirtualPlacements, createPlaceholderPass } from './term/placeholders.ts'
 
@@ -21,6 +21,8 @@ export type PipelineOptions = {
   emitter: PlaceEmitter
   /** Current cell size, read at each placement. */
   cellSize: () => CellSize
+  /** The outer terminal's size in cells, read at each placement (placements are clipped to it). */
+  screen?: () => ScreenSize
   /**
    * Writes to the outer terminal. May return a promise (e.g. resolving on
    * 'drain'); later output then waits for it, so nothing is dropped or
@@ -83,6 +85,16 @@ function describe(command: KittyCommand): string {
     .join(',')
   // Keys come from the child: sanitised so they cannot forge or garble log lines.
   return `apc ${printable(keys, 512)} (payload ${command.payload.length} bytes)`
+}
+
+/** Image ids named in a log line before the rest are only counted. */
+const MAX_LOGGED_IDS = 16
+
+/** `ids` for a log line: the first few, then how many more (a range delete can name thousands). */
+function describeIds(ids: readonly number[]): string {
+  if (ids.length === 0) return '(none)'
+  const named = ids.slice(0, MAX_LOGGED_IDS).join(',')
+  return ids.length > MAX_LOGGED_IDS ? `${named} and ${ids.length - MAX_LOGGED_IDS} more` : named
 }
 
 export function createPipeline(options: PipelineOptions): Pipeline {
@@ -188,24 +200,28 @@ export function createPipeline(options: PipelineOptions): Pipeline {
     switch (event.kind) {
       case 'place': {
         log(`place image ${event.imageId} ${event.image.width}x${event.image.height} in ${event.columns}x${event.rows} cells, cursor ${event.cursor}`)
-        await writeOut(emitter(event, cellSize()))
+        await writeOut(emitter(event, cellSize(), options.screen?.()))
         break
       }
-      case 'virtual':
-        log(`virtual placement of image ${event.imageId}${event.placementId === undefined ? '' : ` placement ${event.placementId}`} ${event.image.width}x${event.image.height} in ${event.columns}x${event.rows} cells`)
+      case 'virtual': {
+        const { width, height } = event.source ?? event.image
+        log(`virtual placement of image ${event.imageId}${event.placementId === undefined ? '' : ` placement ${event.placementId}`} ${width}x${height} in ${event.columns}x${event.rows} cells`)
+        // The image is the engine's own (no copy); the source rectangle is cut when drawn.
         virtualPlacements.set({
           imageId: event.imageId,
           placementId: event.placementId,
           image: event.image,
+          ...(event.source === undefined ? {} : { source: event.source }),
           columns: event.columns,
           rows: event.rows,
         })
         break
+      }
       case 'respond':
         writeChild(event.data)
         break
       case 'delete':
-        log(`delete images ${event.imageIds.join(',') || '(none)'}`)
+        log(`delete images ${describeIds(event.imageIds)}`)
         virtualPlacements.delete(event.imageIds, event.virtual)
         break
       case 'log':

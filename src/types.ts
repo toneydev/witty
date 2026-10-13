@@ -62,8 +62,10 @@ export type CursorPolicy = 'move' | 'stay'
  *
  * `virtual`: a virtual placement (`U=1`) was created or its image replaced.
  * Nothing is drawn now; the image appears where the program later writes
- * unicode placeholder cells (U+10EEEE) for it. `image` is the source (after
- * any `x,y,w,h` crop), `columns` × `rows` the cell box it is scaled to. A
+ * unicode placeholder cells (U+10EEEE) for it. `image` is the stored image
+ * itself (shared, never copied), `source` the part of it shown (the
+ * `x,y,w,h` rectangle, absent for the whole image; it is cut out only when
+ * the placement is drawn), `columns` × `rows` the cell box it is scaled to. A
  * later `virtual` with the same `imageId` and `placementId` replaces it.
  *
  * `delete`: placements were removed; the emitter may erase nothing (sixel has
@@ -75,7 +77,7 @@ export type CursorPolicy = 'move' | 'stay'
  */
 export type EngineEvent =
   | { kind: 'place'; image: Rgba; columns: number; rows: number; cursor: CursorPolicy; imageId: number }
-  | { kind: 'virtual'; imageId: number; placementId: number | undefined; image: Rgba; columns: number; rows: number }
+  | { kind: 'virtual'; imageId: number; placementId: number | undefined; image: Rgba; source?: SourceRect; columns: number; rows: number }
   | { kind: 'respond'; data: string }
   | { kind: 'delete'; imageIds: number[]; virtual?: VirtualPlacementKey[] }
   | { kind: 'log'; message: string }
@@ -86,9 +88,20 @@ export type VirtualPlacementKey = {
   placementId: number | undefined
 }
 
+/** A pixel rectangle inside an image (kitty's `x,y,w,h`, clamped to the image). */
+export type SourceRect = {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
 /** A virtual placement as the placeholder pass sees it (the payload of a `virtual` event). */
 export type VirtualPlacement = VirtualPlacementKey & {
+  /** The stored image, shared with the engine (not a copy). */
   image: Rgba
+  /** The part of `image` shown; absent for the whole image. */
+  source?: SourceRect
   columns: number
   rows: number
 }
@@ -175,4 +188,11 @@ export type SixelOptions = {
 export type PlaceEmitter = (
   event: Extract<EngineEvent, { kind: 'place' }>,
   cell: CellSize,
+  screen?: ScreenSize,
 ) => Uint8Array
+
+/** The outer terminal's size in cells (0 when unknown). */
+export type ScreenSize = {
+  columns: number
+  rows: number
+}
