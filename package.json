@@ -1,6 +1,6 @@
 {
   "name": "witty",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Hosts a program in a passthrough ConPTY and translates its kitty graphics into sixel, so images show in Windows Terminal and Tabby.",
   "type": "module",
   "license": "MIT",
