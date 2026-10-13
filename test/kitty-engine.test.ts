@@ -653,6 +653,74 @@ test('storing an image (or deleting all placements) does not walk the store', as
   assert.equal(walks, 0)
 })
 
+test('image numbers: deleting the newest falls back to the one before it', async () => {
+  const e = engine()
+  const ids: number[] = []
+  for (const shade of [1, 2, 3]) {
+    const reply = responses(await send(e, `a=t,f=32,s=1,v=1,I=13;${b64(Uint8Array.of(shade, shade, shade, 255))}`))[0] ?? ''
+    ids.push(Number(/i=(\d+)/.exec(reply)?.[1]))
+  }
+  const [oldest, middle, newest] = ids
+  assert.deepEqual(await send(e, 'a=d,d=N,I=13'), [{ kind: 'delete', imageIds: [newest] }])
+  assert.equal(places(await send(e, 'a=p,I=13'))[0]?.imageId, middle)
+  // Freeing the oldest by id leaves the middle one the newest.
+  await send(e, `a=d,d=I,i=${oldest}`)
+  assert.equal(places(await send(e, 'a=p,I=13'))[0]?.imageId, middle)
+  await send(e, 'a=d,d=N,I=13')
+  assert.match(responses(await send(e, 'a=p,I=13'))[0] ?? '', /ENOENT/)
+})
+
+test('d=r touches only images with placements in the range, in id order', async () => {
+  const e = engine()
+  const pixel = b64(Uint8Array.of(1, 2, 3, 255))
+  await send(e, `a=T,f=32,s=1,v=1,i=12,q=2;${pixel}`)
+  await send(e, `a=t,f=32,s=1,v=1,i=11,q=2;${pixel}`)
+  await send(e, `a=T,U=1,f=32,s=1,v=1,i=10,q=2;${pixel}`)
+  await send(e, `a=T,f=32,s=1,v=1,i=20,q=2;${pixel}`)
+  assert.deepEqual(await send(e, 'a=d,d=r,x=10,y=15'), [{ kind: 'delete', imageIds: [10, 12] }])
+  // Nothing in the range is referenced any more, and d=r keeps image data.
+  assert.deepEqual(await send(e, 'a=d,d=r,x=10,y=15'), [])
+  for (const i of [10, 11, 12]) assert.deepEqual(kinds(await send(e, `a=p,i=${i},q=2`)), ['place'], `i=${i}`)
+  assert.deepEqual(await send(e, 'a=d,d=R,x=0,y=4294967295'), [{ kind: 'delete', imageIds: [10, 11, 12, 20] }])
+  assert.match(responses(await send(e, 'a=p,i=20'))[0] ?? '', /ENOENT/)
+})
+
+test('lookups by number and deletes by range or of everything do not walk the store', async () => {
+  const e = engine()
+  const pixel = b64(Uint8Array.of(0, 0, 0, 0))
+  const stored = 2000
+  // Each image keeps a virtual placement, so d=A cannot free it.
+  for (let i = 1; i <= stored; i++) await send(e, `a=T,U=1,f=32,s=1,v=1,i=${i},q=2;${pixel}`)
+  for (let k = 0; k < 50; k++) await send(e, `a=t,f=32,s=1,v=1,I=7,q=2;${pixel}`)
+  // Count every walk of a map or set as large as the store.
+  let walks = 0
+  const restores = [Map.prototype, Set.prototype].map((target) => {
+    const proto = target as unknown as Record<string | symbol, (...args: unknown[]) => unknown>
+    const names: Array<string | symbol> = ['values', 'keys', 'entries', 'forEach', Symbol.iterator]
+    const originals = names.map((name) => proto[name]!)
+    names.forEach((name, k) => {
+      const original = originals[k]!
+      proto[name] = function (this: Map<unknown, unknown> | Set<unknown>, ...args: unknown[]) {
+        if (this.size >= stored) walks++
+        return original.apply(this, args)
+      }
+    })
+    return () => names.forEach((name, k) => (proto[name] = originals[k]!))
+  })
+  try {
+    for (let k = 0; k < 100; k++) await send(e, 'a=p,I=7,q=2')
+    for (let k = 0; k < 100; k++) await send(e, `a=d,d=r,x=${stored + 1},y=1000000`)
+    for (let k = 0; k < 100; k++) await send(e, `a=d,d=R,x=${stored + 1},y=1000000`)
+    for (let k = 0; k < 100; k++) await send(e, 'a=d,d=A')
+  } finally {
+    for (const restore of restores) restore()
+  }
+  assert.equal(walks, 0)
+  // d=A freed the numbered images but kept those with virtual placements.
+  assert.match(responses(await send(e, 'a=p,I=7'))[0] ?? '', /ENOENT/)
+  assert.deepEqual(kinds(await send(e, `a=p,i=${stored},q=2`)), ['place'])
+})
+
 test('placement ids past the bound are counted, not stored, and keep the image referenced', async () => {
   const e = engine({ maxPlacementIds: 2 })
   await send(e, `a=t,f=32,s=1,v=1,i=1,q=2;${b64(Uint8Array.of(1, 2, 3, 255))}`)

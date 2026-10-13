@@ -92,7 +92,7 @@ deletes by screen position. They are accepted and logged.
 
 ```powershell
 npm run typecheck
-npm test                 # 247 tests: protocol, encoder, placeholders, host, and an end-to-end run in a ConPTY
+npm test                 # 250 tests: protocol, encoder, placeholders, host, and an end-to-end run in a ConPTY
 tools\probe-terminal.ps1 # what does this terminal answer to graphics queries?
 ```
 

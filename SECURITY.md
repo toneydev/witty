@@ -27,7 +27,8 @@ What witty guarantees:
   only inside the OS temp directory under kitty's naming rule. `--no-files` turns it off entirely.
 - Memory and CPU are bounded: payloads, decoded images, the image store (bytes and image count),
   virtual placements, placement boxes, scaling scratch memory, held bytes and caches all have caps,
-  zlib and PNG decoding are capped before decompression, and a placement draws at most a screenful.
+  zlib and PNG decoding are capped before decompression, a placement draws at most a screenful,
+  and no single command walks the whole image store.
 - Nothing is run from the current directory: the child command and the portable launcher's
   `node.exe` are found on `PATH` only, and `cmd.exe` by absolute path. Arguments to a `.cmd`/`.bat`
   child (npm's `claude.cmd`) are quoted so cmd.exe cannot run any part of them as a command;

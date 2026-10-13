@@ -181,7 +181,8 @@ side and 16,777,216 pixels in area. A larger box is scaled down proportionally, 
 draws smaller than its cells. For a virtual placement the strips are cut with a matching smaller
 cell, so they still tile. Decoded images are capped at 64 MiB of RGBA, payloads at 32 MiB, and the
 image store at 256 MiB and 4096 images (LRU; storing an image costs constant time while the store
-fits). At most 4096 virtual placements are kept (past that the oldest is dropped, with a log line
+fits). No command walks the store: images are indexed by number (the newest with each `I`), by
+id in order (for `d=r`/`d=R` ranges) and by whether anything references them (for `d=a`/`d=A`). At most 4096 virtual placements are kept (past that the oldest is dropped, with a log line
 and a `delete`), and 1024 distinct placement ids per image (the rest are only counted, so the image
 stays referenced). The placeholder caches share 128 MiB and the encoded placement cache 32 MiB. A
 normal placement costs at most one screenful of sixel per put (see "Placement semantics").

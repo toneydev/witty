@@ -56,8 +56,10 @@ type StoredImage = {
   /** The client's image number (`I`), if it was transmitted with one. */
   number: number
   rgba: Rgba
-  /** Transmission order, to find the newest image with a number. */
-  seq: number
+  /** The previous image transmitted with the same number, if any. */
+  older: StoredImage | undefined
+  /** The next image transmitted with the same number (none for the newest). */
+  newer: StoredImage | undefined
   /** Named placements (`p`), at most `maxPlacementIds` of them. */
   placements: Set<number>
   /** Placements without a `p`, and named ones past the bound (only cleared together). */
@@ -114,8 +116,15 @@ export class Engine implements KittyEngine {
   readonly #virtualOrder = new Map<string, VirtualEntry>()
   /** The stored images with normal placements. */
   readonly #placed = new Set<StoredImage>()
+  /** The newest stored image with each number (`I`); older ones chain through `older`. */
+  readonly #byNumber = new Map<number, StoredImage>()
+  /** The ids of all stored images, for `d=R`. */
+  readonly #ids = new SortedIds()
+  /** The ids of stored images with any placement, normal or virtual, for `d=r`. */
+  readonly #referenced = new SortedIds()
+  /** The stored images without any placement, for `d=A`. */
+  readonly #unreferenced = new Set<StoredImage>()
   #storeBytes = 0
-  #seq = 0
   #nextId = FIRST_ALLOCATED_ID
   #loading: Loading | null = null
   readonly #logged = new Set<string>()
@@ -233,13 +242,16 @@ export class Engine implements KittyEngine {
       id,
       number,
       rgba,
-      seq: ++this.#seq,
+      older: undefined,
+      newer: undefined,
       placements: new Set(),
       anonymousPlacements: 0,
       virtual: new Map(),
     }
     this.#images.set(id, image)
     this.#storeBytes += rgba.data.length
+    if (number !== 0) this.#linkNumber(image)
+    this.#sync(image)
     // Virtual placements outlive a replacement: they show the new pixels.
     if (carried !== undefined) {
       for (const [p, boxKeys] of carried) {
@@ -308,6 +320,7 @@ export class Engine implements KittyEngine {
     if (p !== 0 && (image.placements.has(p) || image.placements.size < this.#maxPlacementIds)) image.placements.add(p)
     else image.anonymousPlacements++
     this.#placed.add(image)
+    this.#sync(image)
     events.push({
       kind: 'place',
       image: source === undefined ? image.rgba : crop(image.rgba, source.x, source.y, source.width, source.height),
@@ -336,6 +349,7 @@ export class Engine implements KittyEngine {
     if (this.#virtualOrder.size >= this.#maxVirtual) this.#dropOldestVirtual(events)
     image.virtual.set(p, boxKeys)
     this.#virtualOrder.set(key, { image, p })
+    this.#sync(image)
     events.push({
       kind: 'virtual',
       imageId: image.id,
@@ -368,6 +382,7 @@ export class Engine implements KittyEngine {
     }
     if (p !== undefined) forget(p)
     else for (const key of image.virtual.keys()) forget(key)
+    this.#sync(image)
   }
 
   /**
@@ -423,16 +438,14 @@ export class Engine implements KittyEngine {
         // kitty: d=a/A leaves virtual placements alone (only i, I, n, N, r, R
         // delete them), and an image they still reference is not freed.
         const ids: number[] = []
-        // Only images with placements are visited (a flood of d=a must not walk
-        // the store), unless d=A frees the rest. Removing the entry being
-        // visited is safe while iterating a Map or a Set.
+        // Only images with placements are visited, and for d=A the images left
+        // without any, which are all freed: a flood of d=a/A must not walk the
+        // store. Removing the entry being visited is safe while iterating a Set.
         for (const image of this.#placed) {
           ids.push(image.id)
           this.#clearPlacements(image)
         }
-        if (free) {
-          for (const image of this.#images.values()) if (image.virtual.size === 0) this.#remove(image)
-        }
+        if (free) for (const image of this.#unreferenced) this.#remove(image)
         events.push(this.#deleteEvent(ids, []))
         return
       }
@@ -449,11 +462,9 @@ export class Engine implements KittyEngine {
       case 'r': {
         const from = uintKey(keys, 'x')
         const to = uintKey(keys, 'y')
-        // d=r touches only images with placements; d=R frees the rest of the range too.
-        const images: StoredImage[] = []
-        for (const image of this.#images.values()) {
-          if (image.id >= from && image.id <= to && (free || isReferenced(image))) images.push(image)
-        }
+        // d=r touches only images with placements; d=R frees the rest of the
+        // range too. Each looks up just the ids in the range, never the store.
+        const images = (free ? this.#ids : this.#referenced).range(from, to).map((id) => this.#images.get(id)!)
         if (images.length > 0) this.#deletePlacements(events, images, 0, free)
         return
       }
@@ -485,6 +496,7 @@ export class Engine implements KittyEngine {
         image.placements.delete(p)
         if (!hasPlacements(image)) this.#placed.delete(image)
         this.#forgetVirtual(image, removed, p)
+        this.#sync(image)
       } else {
         this.#clearPlacements(image)
         this.#forgetVirtual(image, removed)
@@ -505,11 +517,39 @@ export class Engine implements KittyEngine {
   }
 
   #newestWithNumber(number: number): StoredImage | undefined {
-    let newest: StoredImage | undefined
-    for (const image of this.#images.values()) {
-      if (image.number === number && (newest === undefined || image.seq > newest.seq)) newest = image
+    return this.#byNumber.get(number)
+  }
+
+  /** Makes `image` the newest with its number. */
+  #linkNumber(image: StoredImage): void {
+    const newest = this.#byNumber.get(image.number)
+    if (newest !== undefined) {
+      newest.newer = image
+      image.older = newest
     }
-    return newest
+    this.#byNumber.set(image.number, image)
+  }
+
+  /** Takes `image` out of the chain of images with its number. */
+  #unlinkNumber(image: StoredImage): void {
+    const { older, newer } = image
+    if (older !== undefined) older.newer = newer
+    if (newer !== undefined) newer.older = older
+    else if (older !== undefined) this.#byNumber.set(image.number, older)
+    else this.#byNumber.delete(image.number)
+    image.older = image.newer = undefined
+  }
+
+  /** Brings the id indexes and the unreferenced set in step with `image`. */
+  #sync(image: StoredImage): void {
+    const stored = this.#images.get(image.id) === image
+    const referenced = stored && isReferenced(image)
+    if (stored) this.#ids.add(image.id)
+    else this.#ids.delete(image.id)
+    if (referenced) this.#referenced.add(image.id)
+    else this.#referenced.delete(image.id)
+    if (stored && !referenced) this.#unreferenced.add(image)
+    else this.#unreferenced.delete(image)
   }
 
   #allocateId(): number {
@@ -535,12 +575,15 @@ export class Engine implements KittyEngine {
     this.#storeBytes -= image.rgba.data.length
     this.#placed.delete(image)
     for (const p of image.virtual.keys()) this.#virtualOrder.delete(virtualKey(image.id, p))
+    if (image.number !== 0) this.#unlinkNumber(image)
+    this.#sync(image)
   }
 
   #clearPlacements(image: StoredImage): void {
     image.placements.clear()
     image.anonymousPlacements = 0
     this.#placed.delete(image)
+    this.#sync(image)
   }
 
   #overBudget(): boolean {
@@ -596,6 +639,40 @@ export class Engine implements KittyEngine {
     if (this.#logged.has(tag)) return
     this.#logged.add(tag)
     events.push({ kind: 'log', message })
+  }
+}
+
+/** A set of image ids kept in order, so a range of them is found without a walk. */
+class SortedIds {
+  readonly #ids: number[] = []
+
+  add(id: number): void {
+    const k = this.#lowerBound(id)
+    if (this.#ids[k] !== id) this.#ids.splice(k, 0, id)
+  }
+
+  delete(id: number): void {
+    const k = this.#lowerBound(id)
+    if (this.#ids[k] === id) this.#ids.splice(k, 1)
+  }
+
+  /** The ids from `from` to `to`, inclusive, in order. */
+  range(from: number, to: number): number[] {
+    const found: number[] = []
+    for (let k = this.#lowerBound(from); k < this.#ids.length && this.#ids[k]! <= to; k++) found.push(this.#ids[k]!)
+    return found
+  }
+
+  /** The index of the first id not below `id`. */
+  #lowerBound(id: number): number {
+    let low = 0
+    let high = this.#ids.length
+    while (low < high) {
+      const mid = (low + high) >>> 1
+      if (this.#ids[mid]! < id) low = mid + 1
+      else high = mid
+    }
+    return low
   }
 }
 
