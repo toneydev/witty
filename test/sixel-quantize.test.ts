@@ -68,6 +68,42 @@ test('median cut maps to the nearest palette colour', () => {
   assert.ok(q.palette[right * 3]! > 220)
 })
 
+test('median cut picks the nearest palette entry of each cell centre, lowest index on ties', () => {
+  const rand = rng(5)
+  const image = make(120, 90, (x, y) => [(x * 2 + Math.floor(rand() * 40)) & 255, (y * 3) & 255, Math.floor(rand() * 256), 255])
+  for (const max of [3, 37, 256]) {
+    const q = quantize(image, max)
+    const n = q.palette.length / 3
+    for (let i = 0; i < image.width * image.height; i++) {
+      // The full search, over the 6-bit cell centre of the pixel.
+      const centre = [0, 1, 2].map((k) => (image.data[i * 4 + k]! & 0xfc) + 1.5)
+      let best = Infinity
+      let expected = 0
+      for (let k = 0; k < n; k++) {
+        const d = [0, 1, 2].reduce((sum, ch) => sum + (q.palette[k * 3 + ch]! - centre[ch]!) ** 2, 0)
+        if (d < best) {
+          best = d
+          expected = k
+        }
+      }
+      assert.equal(q.indices[i], expected, `max=${max} pixel ${i}`)
+    }
+  }
+})
+
+test('results do not depend on earlier calls', () => {
+  const rand = rng(23)
+  const noisy = (alpha: boolean) =>
+    make(64, 48, () => [Math.floor(rand() * 256), Math.floor(rand() * 256), Math.floor(rand() * 256), alpha && rand() < 0.3 ? 0 : 255])
+  const a = noisy(false)
+  const b = noisy(true)
+  const first = quantize(a, 64)
+  const between = quantize(b, 200)
+  assert.deepEqual(quantize(a, 64), first)
+  quantize(noisy(false), 17)
+  assert.deepEqual(quantize(b, 200), between)
+})
+
 test('an all-transparent image has an empty palette', () => {
   const q = quantize(solid(3, 3, 1, 2, 3, 0), 256)
   assert.equal(q.palette.length, 0)
