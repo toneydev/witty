@@ -88,6 +88,17 @@ describe('resolve', () => {
     assert.equal(findExecutable('tool', { env: { ...env, Path: `"${bin2}";${bin1}` } }), path.join(bin2, 'tool.cmd'))
   })
 
+  it('skips relative PATH entries, which would search the current directory', () => {
+    const checked: string[] = []
+    const isFile = (file: string): boolean => {
+      checked.push(file)
+      return path.win32.basename(file).toLowerCase() === 'other.exe'
+    }
+    const found = findExecutable('other', { env: { ...env, Path: `.;bin;..\\up;C:drive-relative;"";${bin1}` }, isFile })
+    assert.equal(found, path.join(bin1, 'other.exe'))
+    assert.ok(checked.every((file) => path.win32.isAbsolute(file)), checked.join(' | '))
+  })
+
   it('takes a name with an extension as is', () => {
     assert.equal(findExecutable('script.ps1', { env }), path.join(bin2, 'script.ps1'))
     assert.equal(findExecutable('tool.exe', { env }), undefined)

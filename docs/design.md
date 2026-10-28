@@ -196,7 +196,8 @@ is now 30 s (`WITTY_CONSOLE_HELPER_TIMEOUT_MS` overrides it), and a failure is n
 line carries the helper's stderr and witty goes on without VT input.
 
 **The child command** (`host/resolve.ts`) is looked up in the `PATH` directories only, never the
-current directory. A `.cmd`/`.bat` file (npm's `claude.cmd`) runs as
+current directory; relative `PATH` entries (`.`, `bin`, `C:tools`) are skipped, since they would
+search it after all. A `.cmd`/`.bat` file (npm's `claude.cmd`) runs as
 `cmd.exe /d /e:on /v:off /s /c ""<file>" <args>"`, with `ComSpec` or else
 `%SystemRoot%\System32\cmd.exe`. cmd parses the arguments twice, once on that line and again where
 the batch file expands `%*`, so they are quoted the way Rust does since CVE-2024-24576: anything
