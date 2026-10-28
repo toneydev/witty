@@ -345,16 +345,23 @@ describe('placeholder pass', () => {
     assert.equal(t.run(input), latin1(enc.encode(input)))
   })
 
-  it('cells outside the placement box are blanked; strips are cut at image edges', () => {
+  it('cells outside the placement box are blanked; strips are cut at the box edge', () => {
     const image = cellImage(2, 1)
     const t = setup(placement(42, image, 2, 1))
     const outside = t.run(`\x1b[38;5;42m${row(1, 2)}x`)
     assert.equal(outside, '\x1b[38;5;42m  x')
     const found = strips(t.run(`\x1b[38;5;42m${row(0, 3, 1)}x`))
     assert.equal(found.length, 1)
-    assert.equal(found[0]!.cells, 3)
-    assert.deepEqual(pixel(found[0]!.image, 0, 0), pixel(image, 4, 0))
-    assert.deepEqual(pixel(found[0]!.image, 4, 0), [0, 0, 0, 0], 'past the image: transparent')
+    assert.equal(found[0]!.cells, 3, 'all three cells are blanked and stepped over')
+    assertPixels(found[0]!.image, cropRgba(image, 4, 0, 4, 6), 'only the cell inside the box is drawn')
+  })
+
+  it('a long run past the box encodes no more than the box', () => {
+    const t = setup(placement(42, cellImage(8, 2), 8, 2))
+    const found = strips(t.run(`\x1b[38;5;42m${cell(0, 0)}${PH.repeat(9999)}x`))
+    assert.equal(found.length, 1)
+    assert.equal(found[0]!.cells, 10_000)
+    assert.equal(found[0]!.image.width, 8 * CELL.width)
   })
 
   it('a replaced placement shows its new pixels; the cell size is read per strip', () => {

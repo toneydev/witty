@@ -29,8 +29,9 @@ What witty guarantees:
   virtual placements, placement boxes, scaling scratch memory, held bytes and caches all have caps,
   zlib and PNG decoding are capped before decompression, a placement draws at most a screenful,
   and no single command walks the whole image store.
-- Nothing is run from the current directory: the child command and the portable launcher's
-  `node.exe` are found on `PATH` only, and `cmd.exe` by absolute path. Arguments to a `.cmd`/`.bat`
+- Nothing is run from the current directory: the child command is found in the absolute `PATH`
+  directories only (relative entries such as `.` are skipped), the portable launcher's `node.exe`
+  on `PATH` only, and `cmd.exe` by absolute path. Arguments to a `.cmd`/`.bat`
   child (npm's `claude.cmd`) are quoted so cmd.exe cannot run any part of them as a command;
   arguments holding CR, LF or NUL are refused for batch children.
 - The pseudo-console is Microsoft's own: node-pty's bundled `conpty.dll` and `OpenConsole.exe` are

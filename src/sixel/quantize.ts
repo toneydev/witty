@@ -15,6 +15,10 @@
 //    index on ties), cached per 6-bit histogram cell (the cell's centre is
 //    matched), so each cell is searched once.
 //
+// The per-cell tables are allocated once and only the cells an image uses
+// are touched (and reset after): allocating and scanning all 2^18 cells per
+// call cost more than quantizing a placeholder strip itself.
+//
 // Everything is deterministic: same input, same output.
 
 import type { Rgba } from '../types.ts'
@@ -72,9 +76,45 @@ export function quantize(image: Rgba, maxColors: number, opts: QuantizeOptions =
     return { palette: exact, indices, transparentIndex: Math.max(255, n) }
   }
 
-  const palette = medianCut(data, count, threshold, limit)
-  mapNearest(data, count, threshold, palette, indices)
-  return { palette, indices, transparentIndex: 255 }
+  const t = tables()
+  const cells = histogram(data, count, threshold, t)
+  try {
+    const palette = medianCut(cells, limit, t)
+    mapNearest(data, count, threshold, palette, indices, t.nearest)
+    return { palette, indices, transparentIndex: 255 }
+  } finally {
+    // Leave the shared tables clean for the next call.
+    for (const c of cells) {
+      t.hist[c] = 0
+      t.sumR[c] = 0
+      t.sumG[c] = 0
+      t.sumB[c] = 0
+      t.nearest[c] = -1
+    }
+  }
+}
+
+/** Per-cell tables shared by every call: zero sums and counts, -1 for "not searched yet". */
+type Tables = {
+  hist: Float64Array
+  sumR: Float64Array
+  sumG: Float64Array
+  sumB: Float64Array
+  /** The palette index matched to each cell. */
+  nearest: Int16Array
+}
+
+let shared: Tables | undefined
+
+function tables(): Tables {
+  shared ??= {
+    hist: new Float64Array(CELLS),
+    sumR: new Float64Array(CELLS),
+    sumG: new Float64Array(CELLS),
+    sumB: new Float64Array(CELLS),
+    nearest: new Int16Array(CELLS).fill(-1),
+  }
+  return shared
 }
 
 /** Fills `indices` and returns the palette if there are <= `limit` distinct opaque colours; else null. */
@@ -130,11 +170,11 @@ function coord(cell: number, axis: number): number {
 /** A median-cut box: the cells `cells[start..end)`, its split priority and axis. */
 type Box = { start: number; end: number; score: number; axis: number }
 
-function medianCut(data: Uint8Array, count: number, threshold: number, limit: number): Uint8Array {
-  const hist = new Float64Array(CELLS)
-  const sumR = new Float64Array(CELLS)
-  const sumG = new Float64Array(CELLS)
-  const sumB = new Float64Array(CELLS)
+/** Histograms the opaque pixels into `t`; returns the cells used, ascending. */
+function histogram(data: Uint8Array, count: number, threshold: number, t: Tables): Int32Array {
+  const { hist, sumR, sumG, sumB } = t
+  const cells = new Int32Array(Math.min(count, CELLS))
+  let used = 0
   for (let i = 0; i < count; i++) {
     const p = i * 4
     if (data[p + 3]! < threshold) continue
@@ -142,15 +182,19 @@ function medianCut(data: Uint8Array, count: number, threshold: number, limit: nu
     const g = data[p + 1]!
     const b = data[p + 2]!
     const c = cellOf(r, g, b)
+    if (hist[c] === 0) cells[used++] = c
     hist[c]! += 1
     sumR[c]! += r
     sumG[c]! += g
     sumB[c]! += b
   }
-  let used = 0
-  for (let c = 0; c < CELLS; c++) if (hist[c]! > 0) used++
-  const cells = new Int32Array(used)
-  for (let c = 0, k = 0; c < CELLS; c++) if (hist[c]! > 0) cells[k++] = c
+  return cells.subarray(0, used).sort()
+}
+
+/** The palette for the histogrammed `cells` (reordered in place). */
+function medianCut(cells: Int32Array, limit: number, t: Tables): Uint8Array {
+  const { hist, sumR, sumG, sumB } = t
+  const used = cells.length
   const sorted = new Int32Array(used)
 
   const measure = (start: number, end: number): Box => {
@@ -249,10 +293,12 @@ function mapNearest(
   threshold: number,
   palette: Uint8Array,
   indices: Uint8Array,
+  cache: Int16Array,
 ): void {
   const n = palette.length / 3
-  const cache = new Int16Array(CELLS).fill(-1)
   const half = (1 << SHIFT) / 2 - 0.5
+  const byRed = Int32Array.from({ length: n }, (_, k) => k).sort((a, b) => palette[a * 3]! - palette[b * 3]! || a - b)
+  const reds = Int32Array.from(byRed, (k) => palette[k * 3]!)
   for (let i = 0; i < count; i++) {
     const p = i * 4
     if (data[p + 3]! < threshold) {
@@ -265,20 +311,52 @@ function mapNearest(
       const r = (coord(c, 0) << SHIFT) + half
       const g = (coord(c, 1) << SHIFT) + half
       const b = (coord(c, 2) << SHIFT) + half
-      let best = Infinity
-      idx = 0
-      for (let k = 0; k < n; k++) {
-        const dr = palette[k * 3]! - r
-        const dg = palette[k * 3 + 1]! - g
-        const db = palette[k * 3 + 2]! - b
-        const d = dr * dr + dg * dg + db * db
-        if (d < best) {
-          best = d
-          idx = k
-        }
-      }
+      idx = nearestIndex(palette, byRed, reds, r, g, b)
       cache[c] = idx
     }
     indices[i] = idx
   }
+}
+
+/**
+ * The palette entry nearest `r`,`g`,`b` (squared distance, lowest index on
+ * ties), searched outwards from `r` in red order (`byRed`, with `reds` their
+ * reds) until red alone is at least the best distance on both sides. That
+ * stop is exact for cell centres: they sit between channel values, so green
+ * and blue always add to the distance and a stopped entry could not even tie.
+ */
+function nearestIndex(palette: Uint8Array, byRed: Int32Array, reds: Int32Array, r: number, g: number, b: number): number {
+  const n = reds.length
+  let up = 0
+  let down = n
+  while (up < down) {
+    const mid = (up + down) >>> 1
+    if (reds[mid]! < r) up = mid + 1
+    else down = mid
+  }
+  down = up - 1
+  let best = Infinity
+  let idx = 0
+  while (up < n || down >= 0) {
+    let k: number
+    // Step to the side whose red is closer; once it is out of reach, so is the other.
+    if (up < n && (down < 0 || reds[up]! - r <= r - reds[down]!)) {
+      const dr = reds[up]! - r
+      if (dr * dr >= best) break
+      k = byRed[up++]!
+    } else {
+      const dr = r - reds[down]!
+      if (dr * dr >= best) break
+      k = byRed[down--]!
+    }
+    const dr = palette[k * 3]! - r
+    const dg = palette[k * 3 + 1]! - g
+    const db = palette[k * 3 + 2]! - b
+    const d = dr * dr + dg * dg + db * db
+    if (d < best || (d === best && k < idx)) {
+      best = d
+      idx = k
+    }
+  }
+  return idx
 }

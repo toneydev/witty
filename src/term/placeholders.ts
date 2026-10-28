@@ -422,7 +422,9 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
     const key = `${row},${c0},${n}`
     let bytes = cache.strips.get(key)
     if (bytes === undefined) {
-      const { x0, x1, y0, y1 } = stripRect(row, c0, n, cache.cut)
+      // Cells past the box's right edge show nothing, as outside it: they get
+      // only their spaces, so a long run costs no more sixel than the box.
+      const { x0, x1, y0, y1 } = stripRect(row, c0, Math.min(n, columns - c0), cache.cut)
       const strip = cropRgba(cache.scaled, x0, y0, x1 - x0, y1 - y0)
       bytes = encodePlaceholderStrip(strip, n, sixelOptions)
       if (cache.strips.size >= MAX_STRIPS_PER_PLACEMENT) {

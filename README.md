@@ -43,11 +43,11 @@ ConPTY). Nothing to configure in either terminal.
 ### Portable release (no build)
 
 Download `witty-<version>-win-x64.zip` from the [releases page](https://github.com/toneydev/witty/releases)
-(latest: 0.2.2), extract it anywhere, and either run `witty.cmd` from there or install it for your user:
+(latest: 0.2.3), extract it anywhere, and either run `witty.cmd` from there or install it for your user:
 
 ```powershell
-Expand-Archive witty-0.2.2-win-x64.zip
-powershell -ExecutionPolicy Bypass -File .\witty-0.2.2-win-x64\install.ps1
+Expand-Archive witty-0.2.3-win-x64.zip
+powershell -ExecutionPolicy Bypass -File .\witty-0.2.3-win-x64\install.ps1
 ```
 
 `install.ps1` copies the folder to `%LOCALAPPDATA%\Programs\witty` and adds it to your user PATH

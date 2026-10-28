@@ -195,8 +195,8 @@ export const emitPlacement: PlaceEmitter = createPlaceEmitter()
 
 /**
  * The bytes that stand in for `cells` unicode placeholder cells at the
- * cursor, drawing `strip` (already `cells * cell.width` × `cell.height`
- * pixels) over them:
+ * cursor, drawing `strip` (already cut to the cells it covers: all of them,
+ * or the leading ones inside the placement's box) over them:
  *
  *   ESC 7  <cells spaces>  ESC 8  <sixel DCS>  ESC 8  CSI cells C
  *

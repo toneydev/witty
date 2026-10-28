@@ -56,10 +56,12 @@ function isPathLike(name: string): boolean {
 
 /**
  * Finds the file `name` refers to: a path is taken relative to `cwd`;
- * a bare name is looked up in each `PATH` directory, first with each `PATHEXT`
- * extension (unless it already has an extension), then bare. A path without
- * an extension also gets the `PATHEXT` treatment. Returns undefined when
- * nothing matches.
+ * a bare name is looked up in each absolute `PATH` directory, first with each
+ * `PATHEXT` extension (unless it already has an extension), then bare.
+ * Relative entries (`.`, `bin`, `C:tools`) are skipped: they would search the
+ * current directory, which a bare name never does here. A path without an
+ * extension also gets the `PATHEXT` treatment. Returns undefined when nothing
+ * matches.
  */
 export function findExecutable(name: string, options: ResolveOptions = {}): string | undefined {
   const env = options.env ?? process.env
@@ -81,7 +83,7 @@ export function findExecutable(name: string, options: ResolveOptions = {}): stri
   const dirs = (getEnv(env, 'PATH') ?? '')
     .split(';')
     .map((d) => d.trim().replace(/^"(.*)"$/, '$1'))
-    .filter((d) => d.length > 0)
+    .filter((d) => path.win32.isAbsolute(d))
   for (const dir of dirs) {
     const hit = candidatesIn(path.win32.join(dir, name)).find(isFile)
     if (hit !== undefined) return hit
