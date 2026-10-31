@@ -6,13 +6,17 @@
 //   CSI 18 t   text area in cells    reply CSI 8 ; rows ; cols t
 //   CSI 16 t   cell size in pixels   reply CSI 6 ; height ; width t
 //
+// It does not wait for the answers: the child starts at once with the
+// configured fallback (`--cell`, decimals allowed), and the answers, which
+// come back on the input like anything else, are taken out of it
+// (ReplyFilter) and replace the fallback as they arrive (trackCellSize).
+//
 // xterm.js (Tabby) has fractional cells in CSS pixels and rounds its 16 t
 // reply, so a strip of n cells drawn at the rounded size is off by up to n/2
 // pixels. The text area divided by the cell count is exact, so it wins:
 // cell = pixelWidth / cols × pixelHeight / rows (cols and rows from the 18 t
 // reply, else the console's own size). Without a 14 t reply the 16 t reply
-// is used, and without either the configured fallback (`--cell`, decimals
-// allowed).
+// is used, and without either the fallback stays.
 
 import type { CellSize } from '../types.ts'
 
@@ -118,198 +122,88 @@ export function parseCellOption(value: string): CellSize | undefined {
 /** Where a cell size came from. */
 export type CellSource = 'text area' | 'terminal reply' | 'fallback'
 
-/** The readable side `learnCellSize` listens on (process.stdin, already raw). */
-export interface ByteSource {
-  on(event: 'data', listener: (chunk: Buffer | string) => void): unknown
-  off(event: 'data', listener: (chunk: Buffer | string) => void): unknown
-  pause(): unknown
-}
-
-export type LearnCellSizeOptions = {
-  /** Where replies arrive. Default process.stdin. */
-  input?: ByteSource
-  /** Writes the queries. Default: process.stdout.write. */
-  write?: (data: string) => void
-  /** Used when the terminal does not answer in time. Default 10x20. */
-  fallback?: CellSize
-  /** The console size in cells, when the terminal does not answer CSI 18 t. Default process.stdout's. */
-  screen?: () => { columns: number; rows: number }
-  /** How long to wait for any answer. Default 300 ms. */
-  timeoutMs?: number
-  /** After a reply, how long to wait for the others. Default 60 ms. */
-  settleMs?: number
-}
-
-export type LearnedCellSize = {
-  cell: CellSize
-  /** True when the terminal answered; false when the fallback was used. */
-  fromTerminal: boolean
-  /** Which answer the cell size is from. */
-  source: CellSource
-  /** Every size report received, in order. */
-  reports: WindowReport[]
-  /**
-   * The kinds asked for that did not come back in time. The terminal answers
-   * in order, so the first such reply seen later is still witty's (see
-   * {@link ReplyFilter}).
-   */
-  missing: Set<WindowReport['kind']>
-  /** Everything else read meanwhile (user typing, other replies), to forward to the child. */
-  leftover: Uint8Array
-}
-
 /** The kinds of report the startup queries ask for. */
 export const STARTUP_KINDS: readonly WindowReport['kind'][] = ['text-area', 'cells', 'cell']
 
-/**
- * Picks the cell size from `reports`: the last text area in pixels divided
- * by the last size in cells (or `screen`), else the last CSI 16 t reply.
- */
-export function chooseCellSize(
-  reports: readonly WindowReport[],
-  screen: { columns: number; rows: number } | undefined,
-): { cell: CellSize; source: CellSource } | undefined {
-  const last = (kind: WindowReport['kind']): WindowReport | undefined => {
-    for (let i = reports.length - 1; i >= 0; i--) if (reports[i]!.kind === kind) return reports[i]
-    return undefined
-  }
-  const area = last('text-area')
-  if (area !== undefined) {
-    const cells = last('cells')
-    const derived = deriveCellSize(area, cells !== undefined ? { columns: cells.width, rows: cells.height } : (screen ?? { columns: 0, rows: 0 }))
-    if (derived !== undefined) return { cell: derived, source: 'text area' }
-  }
-  const cell = last('cell')
-  if (cell !== undefined) return { cell: { width: cell.width, height: cell.height }, source: 'terminal reply' }
-  return undefined
+/** A cell size, where it came from, and what {@link trackCellSize} keeps between reads. */
+export type TrackedCellSize = {
+  cell: CellSize
+  source: CellSource
+  /**
+   * Witty's own text-area answer (CSI 14 t), kept while the answer to its
+   * CSI 18 t may still come in a later read: that cell count divides it.
+   */
+  area?: { width: number; height: number }
 }
 
 /**
- * Sends the startup queries and collects the replies: it resolves once all
- * three have arrived, `settleMs` after the latest reply when some never come,
- * or after `timeoutMs` with the fallback when none does. Every other byte
- * read meanwhile is returned in `leftover`, in order. The input is PAUSED
- * when this resolves, so no byte is lost before the caller attaches its own
- * listener; the caller must `resume()` it.
- */
-export function learnCellSize(options: LearnCellSizeOptions = {}): Promise<LearnedCellSize> {
-  const input = options.input ?? process.stdin
-  const write = options.write ?? ((s: string) => void process.stdout.write(s))
-  const fallback = options.fallback ?? DEFAULT_CELL_SIZE
-  const screen =
-    options.screen ?? (() => ({ columns: process.stdout.columns ?? 0, rows: process.stdout.rows ?? 0 }))
-  const timeoutMs = options.timeoutMs ?? 300
-  const settleMs = options.settleMs ?? 60
-
-  return new Promise((resolve) => {
-    let buffered: Uint8Array = new Uint8Array(0)
-    const reports: WindowReport[] = []
-    let done = false
-    let settle: ReturnType<typeof setTimeout> | undefined
-
-    const finish = () => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      clearTimeout(settle)
-      input.off('data', onData)
-      input.pause()
-      const chosen = chooseCellSize(reports, screen())
-      const missing = new Set(STARTUP_KINDS)
-      for (const report of reports) missing.delete(report.kind)
-      resolve({
-        cell: chosen?.cell ?? fallback,
-        fromTerminal: chosen !== undefined,
-        source: chosen?.source ?? 'fallback',
-        reports,
-        missing,
-        leftover: buffered,
-      })
-    }
-
-    const onData = (chunk: Buffer | string) => {
-      const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk
-      const joined = new Uint8Array(buffered.length + bytes.length)
-      joined.set(buffered, 0)
-      joined.set(bytes, buffered.length)
-      // Cut every complete report out; a partial one stays buffered until it completes.
-      const found = parseWindowReports(joined)
-      if (found.length === 0) {
-        buffered = joined
-        return
-      }
-      const kept: Uint8Array[] = []
-      let from = 0
-      for (const report of found) {
-        kept.push(joined.subarray(from, report.start))
-        from = report.end
-        reports.push({ ...report, start: 0, end: 0 })
-      }
-      kept.push(joined.subarray(from))
-      buffered = new Uint8Array(Buffer.concat(kept))
-      const kinds = new Set(reports.map((r) => r.kind))
-      if (kinds.size === 3) {
-        finish()
-        return
-      }
-      clearTimeout(settle)
-      settle = setTimeout(finish, settleMs)
-    }
-
-    const timer = setTimeout(finish, timeoutMs)
-    input.on('data', onData)
-    write(STARTUP_QUERIES)
-  })
-}
-
-/**
- * Follows size reports seen on the input after startup (the child asked, or
- * late answers to witty's own queries): a text area in pixels re-derives the
- * cell size, divided by the size in cells from the same batch (the last
- * `CSI 8 t` in it, wherever it stands: the queries go out 14 t first, so its
- * answer comes before the cell count it needs), else by `screen`; a CSI 16 t
- * reply is taken unless the current size came from the text area and the
- * reply is just its rounding (within a pixel per side).
+ * Follows the size reports seen on the input, one read at a time. `own` are
+ * the answers to witty's startup queries among `reports` (what
+ * {@link ReplyFilter.push} consumed); the rest went to the child, which
+ * asked.
+ *
+ * A text area in pixels re-derives the cell size, divided by the size in
+ * cells from the same read (the last `CSI 8 t` in it, wherever it stands:
+ * the queries go out 14 t first, so its answer comes before the cell count
+ * it needs), else by `screen`. Witty's own cell count re-derives it from
+ * witty's own text area when that came in an earlier read. A CSI 16 t reply
+ * is taken unless the current size came from the text area and the reply
+ * is witty's own (the three answers describe one moment, and the text area
+ * is exact) or just the text area's rounding (within a pixel per side).
+ *
+ * However witty's three answers are split across reads, the size they leave
+ * is the one picked from all three at once: the text area divided by the
+ * cell count (else by `screen`), else the 16 t reply, else `current`.
  */
 export function trackCellSize(
-  current: { cell: CellSize; source: CellSource },
+  current: TrackedCellSize,
   reports: readonly WindowReport[],
   screen: { columns: number; rows: number },
-): { cell: CellSize; source: CellSource } {
-  let state = current
+  own: readonly WindowReport[] = [],
+): TrackedCellSize {
+  let state: { cell: CellSize; source: CellSource } = { cell: current.cell, source: current.source }
+  let area = current.area
   let cells: { columns: number; rows: number } = screen
   for (const report of reports) {
     if (report.kind === 'cells') cells = { columns: report.width, rows: report.height }
   }
   for (const report of reports) {
-    if (report.kind === 'cells') {
-      continue
-    } else if (report.kind === 'text-area') {
+    const mine = own.includes(report)
+    if (report.kind === 'text-area') {
       const derived = deriveCellSize(report, cells)
       if (derived !== undefined) state = { cell: derived, source: 'text area' }
+      if (mine) area = { width: report.width, height: report.height }
+    } else if (report.kind === 'cells') {
+      if (!mine) continue
+      if (area !== undefined) {
+        const derived = deriveCellSize(area, { columns: report.width, rows: report.height })
+        if (derived !== undefined) state = { cell: derived, source: 'text area' }
+      }
+      area = undefined
     } else {
-      const rounding =
+      const keep =
         state.source === 'text area' &&
-        Math.abs(report.width - state.cell.width) < 1 &&
-        Math.abs(report.height - state.cell.height) < 1
-      if (!rounding) state = { cell: { width: report.width, height: report.height }, source: 'terminal reply' }
+        (mine || (Math.abs(report.width - state.cell.width) < 1 && Math.abs(report.height - state.cell.height) < 1))
+      if (!keep) state = { cell: { width: report.width, height: report.height }, source: 'terminal reply' }
+      // The terminal answers in order: after witty's 16 t answer, no answer to its 18 t is still to come.
+      if (mine) area = undefined
     }
   }
-  return state
+  return area === undefined ? state : { ...state, area }
 }
 
 /** Which final parameter each report kind has: `CSI 4 ; ... t` and so on. */
 const KIND_DIGIT: Record<WindowReport['kind'], string> = { 'text-area': '4', cell: '6', cells: '8' }
 
 /**
- * Takes the answers to witty's own startup queries out of the input after
- * the startup window. The terminal answers in order, so the first report of
- * each kind still owed ({@link LearnedCellSize.missing}) is witty's, however
- * late it comes, and is consumed instead of forwarded; every later one goes
- * to the child, which asked for it. While a kind is owed, a chunk that ends
- * in what can only be the start of its report (`ESC [ 6 ;` and digits, which
- * no key sends as a whole read) is held for the next chunk; `flush` hands it
- * back if none comes.
+ * Takes the answers to witty's own startup queries out of the input. The
+ * queries go out before the child starts and the terminal answers in order,
+ * so the first report of each kind still owed (all of {@link STARTUP_KINDS}
+ * at first) is witty's, however late it comes, and is consumed instead of
+ * forwarded; every later one goes to the child, which asked for it. While a
+ * kind is owed, a chunk that ends in what can only be the start of its
+ * report (`ESC [ 6 ;` and digits, which no key sends as a whole read) is
+ * held for the next chunk; `flush` hands it back if none comes.
  */
 export class ReplyFilter {
   private readonly owed: Set<WindowReport['kind']>

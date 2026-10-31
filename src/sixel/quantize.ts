@@ -19,7 +19,8 @@
 //    through the block's short list of entries that can be nearest in it.
 //
 // The per-cell tables are allocated once and only the cells an image uses
-// are touched (and reset after): allocating and scanning all 2^18 cells per
+// are touched (and reset after, one by one, or all at once when it used a
+// sixteenth of them or more): allocating and scanning all 2^18 cells per
 // call cost more than quantizing a placeholder strip itself.
 //
 // Everything is deterministic: same input, same output.
@@ -88,23 +89,34 @@ export function quantize(image: Rgba, maxColors: number, opts: QuantizeOptions =
     mapNearest(data, count, threshold, palette, indices, t.nearest, cells)
     return { palette, indices, transparentIndex: Math.max(255, palette.length / 3) }
   } finally {
-    // Leave the shared tables clean for the next call.
-    for (const c of cells) {
-      t.hist[c] = 0
-      t.sumR[c] = 0
-      t.sumG[c] = 0
-      t.sumB[c] = 0
-      t.nearest[c] = -1
+    // Leave the shared tables clean for the next call: cell by cell, or all
+    // at once when the image used so many cells that that is cheaper.
+    const { stats, nearest } = t
+    if (cells.length * 16 >= CELLS) {
+      stats.fill(0)
+      nearest.fill(-1)
+    } else {
+      for (const c of cells) {
+        const o = c * 4
+        stats[o] = 0
+        stats[o + 1] = 0
+        stats[o + 2] = 0
+        stats[o + 3] = 0
+        nearest[c] = -1
+      }
     }
   }
 }
 
-/** Per-cell tables shared by every call: zero sums and counts, -1 for "not searched yet". */
+/** Per-cell tables shared by every call: zero counts and sums, -1 for "not searched yet". */
 type Tables = {
-  hist: Float64Array
-  sumR: Float64Array
-  sumG: Float64Array
-  sumB: Float64Array
+  /**
+   * Cell c's pixel count at `c * 4`, then the sums of their red, green and
+   * blue. One array rather than four: a pixel touches one cache line, not four
+   * (histogramming a photo, 2^18 cells spread over 8 MiB, took 10 ms with
+   * separate arrays).
+   */
+  stats: Float64Array
   /** The palette index matched to each cell. */
   nearest: Int16Array
 }
@@ -113,10 +125,7 @@ let shared: Tables | undefined
 
 function tables(): Tables {
   shared ??= {
-    hist: new Float64Array(CELLS),
-    sumR: new Float64Array(CELLS),
-    sumG: new Float64Array(CELLS),
-    sumB: new Float64Array(CELLS),
+    stats: new Float64Array(CELLS * 4),
     nearest: new Int16Array(CELLS).fill(-1),
   }
   return shared
@@ -177,7 +186,7 @@ type Box = { start: number; end: number; score: number; axis: number }
 
 /** Histograms the opaque pixels into `t`; returns the cells used, ascending. */
 function histogram(data: Uint8Array, count: number, threshold: number, t: Tables): Int32Array {
-  const { hist, sumR, sumG, sumB } = t
+  const { stats } = t
   const cells = new Int32Array(Math.min(count, CELLS))
   let used = 0
   for (let i = 0; i < count; i++) {
@@ -187,24 +196,25 @@ function histogram(data: Uint8Array, count: number, threshold: number, t: Tables
     const g = data[p + 1]!
     const b = data[p + 2]!
     const c = cellOf(r, g, b)
-    if (hist[c] === 0) cells[used++] = c
-    hist[c]! += 1
-    sumR[c]! += r
-    sumG[c]! += g
-    sumB[c]! += b
+    const o = c * 4
+    if (stats[o] === 0) cells[used++] = c
+    stats[o]! += 1
+    stats[o + 1]! += r
+    stats[o + 2]! += g
+    stats[o + 3]! += b
   }
   // Ascending: sorting costs O(used log used) (10 ms for the 212k cells of a
   // 1500x900 photo), scanning the table O(CELLS) (about 1 ms); scan once the
   // image uses more than a sixteenth of the cells.
   if (used * 16 < CELLS) return cells.subarray(0, used).sort()
   let k = 0
-  for (let c = 0; c < CELLS; c++) if (hist[c] !== 0) cells[k++] = c
+  for (let c = 0; c < CELLS; c++) if (stats[c * 4] !== 0) cells[k++] = c
   return cells.subarray(0, used)
 }
 
 /** The palette for the histogrammed `cells` (reordered in place). */
 function medianCut(cells: Int32Array, limit: number, t: Tables): Uint8Array {
-  const { hist, sumR, sumG, sumB } = t
+  const { stats } = t
   const used = cells.length
   const sorted = new Int32Array(used)
 
@@ -220,7 +230,7 @@ function medianCut(cells: Int32Array, limit: number, t: Tables): Uint8Array {
     let q2 = 0
     for (let k = start; k < end; k++) {
       const c = cells[k]!
-      const w = hist[c]!
+      const w = stats[c * 4]!
       const v0 = coord(c, 0)
       const v1 = coord(c, 1)
       const v2 = coord(c, 2)
@@ -274,7 +284,7 @@ function medianCut(cells: Int32Array, limit: number, t: Tables): Uint8Array {
     for (let k = start; k < end; k++) {
       const c = cells[k]!
       bucket[coord(c, axis) + 1]!++
-      total += hist[c]!
+      total += stats[c * 4]!
     }
     for (let v = 0; v < LEVELS; v++) bucket[v + 1]! += bucket[v]!
     for (let k = start; k < end; k++) {
@@ -287,7 +297,7 @@ function medianCut(cells: Int32Array, limit: number, t: Tables): Uint8Array {
     let acc = 0
     let split = end - 1
     for (let k = start; k < end - 1; k++) {
-      acc += hist[cells[k]!]!
+      acc += stats[cells[k]! * 4]!
       if (acc * 2 >= total) {
         split = k + 1
         break
@@ -305,11 +315,11 @@ function medianCut(cells: Int32Array, limit: number, t: Tables): Uint8Array {
     let g = 0
     let b = 0
     for (let k = start; k < end; k++) {
-      const c = cells[k]!
-      n += hist[c]!
-      r += sumR[c]!
-      g += sumG[c]!
-      b += sumB[c]!
+      const o = cells[k]! * 4
+      n += stats[o]!
+      r += stats[o + 1]!
+      g += stats[o + 2]!
+      b += stats[o + 3]!
     }
     palette[i * 3] = Math.round(r / n)
     palette[i * 3 + 1] = Math.round(g / n)
@@ -373,6 +383,8 @@ function blockOf(cell: number): number {
   )
 }
 
+const EMPTY = new Float64Array(0)
+
 /** The 0..255 value at the centre of 6-bit level `v`. */
 function centre(v: number): number {
   return (v << SHIFT) + (1 << SHIFT) / 2 - 0.5
@@ -400,28 +412,49 @@ export function nearestSearch(palette: Uint8Array, listed: (block: number) => bo
   const lists: (Int16Array | undefined)[] = new Array(BLOCKS * BLOCKS * BLOCKS)
   const RED = new Int16Array(0)
   const nearDistance = new Float64Array(n)
-  const low = new Float64Array(3)
+  // Per axis and block coordinate q (the slab of cells q*BLOCK .. q*BLOCK +
+  // BLOCK-1 on that axis), each entry's squared distance along the axis to
+  // the nearest and to the farthest cell centre of the slab, at
+  // `(axis * BLOCKS + q) * n + k`. A block's distances are then three
+  // lookups per entry, summed in axis order as when they were computed per
+  // block, so the lists are the same. Each slab is filled when a list first
+  // needs it, so an image with few listed blocks (a placeholder strip lists
+  // none or a handful) does no more work than computing per block.
+  let near = EMPTY
+  let far = EMPTY
+  const filled = new Uint8Array(3 * BLOCKS)
   const span = (BLOCK - 1) << SHIFT
+  /** Where slab `q` of `axis` starts in `near` and `far`, filled first if it was not yet. */
+  const slab = (axis: number, q: number): number => {
+    const s = axis * BLOCKS + q
+    const row = s * n
+    if (filled[s] === 1) return row
+    filled[s] = 1
+    if (near.length === 0) {
+      near = new Float64Array(3 * BLOCKS * n)
+      far = new Float64Array(3 * BLOCKS * n)
+    }
+    const lo = centre(q * BLOCK)
+    const hi = lo + span
+    for (let k = 0; k < n; k++) {
+      const v = palette[k * 3 + axis]!
+      const d = v < lo ? lo - v : v > hi ? v - hi : 0
+      near[row + k] = d * d
+      const f = v - lo > hi - v ? v - lo : hi - v
+      far[row + k] = f * f
+    }
+    return row
+  }
 
   const listOf = (block: number): Int16Array => {
-    low[0] = centre(Math.floor(block / (BLOCKS * BLOCKS)) * BLOCK)
-    low[1] = centre((Math.floor(block / BLOCKS) % BLOCKS) * BLOCK)
-    low[2] = centre((block % BLOCKS) * BLOCK)
+    const r0 = slab(0, Math.floor(block / (BLOCKS * BLOCKS)))
+    const g0 = slab(1, Math.floor(block / BLOCKS) % BLOCKS)
+    const b0 = slab(2, block % BLOCKS)
     let bound = Infinity
     for (let k = 0; k < n; k++) {
-      let near = 0
-      let far = 0
-      for (let axis = 0; axis < 3; axis++) {
-        const v = palette[k * 3 + axis]!
-        const lo = low[axis]!
-        const hi = lo + span
-        const d = v < lo ? lo - v : v > hi ? v - hi : 0
-        near += d * d
-        const f = v - lo > hi - v ? v - lo : hi - v
-        far += f * f
-      }
-      nearDistance[k] = near
-      if (far < bound) bound = far
+      nearDistance[k] = near[r0 + k]! + near[g0 + k]! + near[b0 + k]!
+      const farthest = far[r0 + k]! + far[g0 + k]! + far[b0 + k]!
+      if (farthest < bound) bound = farthest
     }
     let size = 0
     for (let k = 0; k < n; k++) if (nearDistance[k]! <= bound) size++

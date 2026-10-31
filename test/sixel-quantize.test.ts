@@ -104,6 +104,19 @@ test('results do not depend on earlier calls', () => {
   assert.deepEqual(quantize(b, 200), between)
 })
 
+test('results do not depend on an earlier image that used most of the cells (tables reset at once)', () => {
+  const rand = rng(29)
+  const small = make(40, 30, () => [Math.floor(rand() * 256), Math.floor(rand() * 256), Math.floor(rand() * 256), rand() < 0.2 ? 0 : 255])
+  // 200x150 random pixels fall in about 28k of the 2^18 cells: past the
+  // sixteenth (16384) from which the tables are cleared whole.
+  const dense = make(200, 150, () => [Math.floor(rand() * 256), Math.floor(rand() * 256), Math.floor(rand() * 256), 255])
+  const before = quantize(small, 100)
+  const denseFirst = quantize(dense, 256)
+  assert.deepEqual(quantize(small, 100), before)
+  assert.deepEqual(quantize(dense, 256), denseFirst)
+  assert.deepEqual(quantize(small, 100), before)
+})
+
 test('an all-transparent image has an empty palette', () => {
   const q = quantize(solid(3, 3, 1, 2, 3, 0), 256)
   assert.equal(q.palette.length, 0)

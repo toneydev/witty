@@ -42,7 +42,7 @@ export interface ChildPty {
   /** Writes input to the child (strings are sent as UTF-8). */
   write(data: string | Uint8Array): void
   resize(cols: number, rows: number): void
-  /** Child output as UTF-8 bytes, in order. */
+  /** Child output as UTF-8 bytes, in order (a read may end inside a character). */
   onData(cb: (bytes: Uint8Array) => void): void
   /** Fires once with the exit code when the child is gone and its output drained. */
   onExit(cb: (exitCode: number) => void): void
@@ -157,11 +157,35 @@ export function releaseNodePty(pty: nodePty.IPty): void {
   }
 }
 
+/**
+ * Makes node-pty hand over the child's output bytes as they came, one char
+ * per byte (latin1), instead of decoding them as UTF-8; true when it took.
+ * node-pty decodes its output socket as UTF-8 and witty wants bytes, and
+ * decoding plus re-encoding cost more than witty's whole pass over the
+ * output (7.6 ms against 1.4 ms per 2.9 MiB of TUI output). The output then
+ * reaches witty in reads that may end inside a character: the splitter and
+ * the placeholder pass work on bytes and hold a partial placeholder for the
+ * next read, and the console writer behind stdout keeps a partial character
+ * across writes. `setEncoding` is on node-pty's Terminal class but not in
+ * its typings. It must run before the first read: the socket connects
+ * asynchronously after spawn, so nothing has been decoded yet.
+ */
+export function readOutputAsBytes(pty: nodePty.IPty): boolean {
+  const setEncoding = (pty as unknown as { setEncoding?: (encoding: string | null) => void }).setEncoding
+  if (typeof setEncoding !== 'function') return false
+  try {
+    setEncoding.call(pty, 'latin1')
+    return true
+  } catch {
+    return false
+  }
+}
+
 function wrap(pty: nodePty.IPty, bundled: boolean): ChildPty {
-  // node-pty decodes the output pipe with a streaming UTF-8 decoder
-  // (socket.setEncoding('utf8')), so a character split across reads arrives
-  // whole in one string; re-encoding each string is therefore lossless for
-  // valid UTF-8 (invalid bytes have already become U+FFFD).
+  // Bytes as latin1 strings when node-pty allows it, else its UTF-8 strings,
+  // re-encoded: lossless for valid UTF-8, since its streaming decoder never
+  // splits a character across reads (invalid bytes are U+FFFD by then).
+  const latin1 = readOutputAsBytes(pty)
   const encoder = new TextEncoder()
   let exited = false
   let exitCode = 0
@@ -204,7 +228,7 @@ function wrap(pty: nodePty.IPty, bundled: boolean): ChildPty {
       }
     },
     onData(cb) {
-      pty.onData((text) => cb(encoder.encode(text)))
+      pty.onData(latin1 ? (text) => cb(Buffer.from(text, 'latin1')) : (text) => cb(encoder.encode(text)))
     },
     onExit(cb) {
       if (exited) queueMicrotask(() => cb(exitCode))
