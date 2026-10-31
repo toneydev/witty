@@ -3,8 +3,12 @@
 // into sixel on the way out, forward the outer terminal's input to it.
 //
 // Startup order matters: raw mode and VT input first (so nothing typed is
-// echoed or cooked), then the cell-size queries (their replies arrive on stdin
-// and must not reach the child), then the child, then the byte streams.
+// echoed or cooked), then the wire, then in one go the cell-size queries, the
+// child and the byte streams. The queries go out before the child exists, so
+// the terminal answers them before anything the child asks, and the first
+// answer of each kind on stdin is taken out as witty's. Nothing waits for
+// them: the child starts with the --cell size, and the answers replace it as
+// they arrive.
 
 import { appendFileSync, readFileSync } from 'node:fs'
 import os from 'node:os'
@@ -16,7 +20,15 @@ import { ensureVtInput, enterRawMode, leaveRawMode } from './host/console.ts'
 import { spawnChild, type ChildPty } from './host/pty.ts'
 import { resolveCommand, type ResolvedCommand } from './host/resolve.ts'
 import { createPipeline, type WireFactory } from './pipeline.ts'
-import { describeReport, formatCell, learnCellSize, ReplyFilter, trackCellSize, type CellSource } from './term/metrics.ts'
+import {
+  describeReport,
+  formatCell,
+  ReplyFilter,
+  STARTUP_KINDS,
+  STARTUP_QUERIES,
+  trackCellSize,
+  type TrackedCellSize,
+} from './term/metrics.ts'
 
 type Log = (line: string) => void
 
@@ -41,6 +53,13 @@ const SIGNAL_EXIT_MS = 1500
  * the rest of it, before it goes to the child after all.
  */
 const REPLY_HOLD_MS = 100
+
+/**
+ * When the child exits this soon after the cell-size queries went out, witty
+ * keeps reading until the answers still owed are in (or this time is up),
+ * so they are not left for the shell to read.
+ */
+const ANSWER_DRAIN_MS = 300
 
 function readVersion(): string {
   try {
@@ -166,25 +185,29 @@ async function main(argv: readonly string[]): Promise<void> {
   enterRawMode()
   log(await ensureVtInput(options.vtInput))
 
-  const learned = await learnCellSize({ fallback: options.cell })
-  for (const report of learned.reports) log(`reply ${describeReport(report)}`)
-  let cell: CellSize = learned.cell
-  let cellSource: CellSource = learned.source
-  log(`cell size ${formatCell(cell)} (${cellSource}), ${learned.leftover.length} leftover input bytes`)
+  // The --cell size until the terminal answers the queries (see forwardInput).
+  let size: TrackedCellSize = { cell: options.cell, source: 'fallback' }
+  const cellSize = (): CellSize => size.cell
 
   log(`scale ${options.scale}`)
   log(`file transports ${options.files ? 'on (policy-checked)' : 'off (--no-files)'}`)
-  const wire = await createWire({ cellSize: () => cell, log, scale: options.scale, files: options.files })
+  const wire = await createWire({ cellSize, log, scale: options.scale, files: options.files })
 
   const env: Record<string, string | undefined> = { ...process.env, WITTY: '1' }
   if (options.force) env.CLAUDE_CODE_FORCE_TERMINAL_IMAGES = '1'
   const cols = process.stdout.columns || 80
   const rows = process.stdout.rows || 24
+  log(`cell size ${formatCell(size.cell)} (fallback, until the terminal answers)`)
+  // From here to the end of main nothing awaits, so no input is read before
+  // forwardInput is in place to take the answers out.
+  process.stdout.write(STARTUP_QUERIES)
+  const queriedAt = Date.now()
   // With inheritCursor the child's ConPTY asks the terminal where its cursor
   // is (CSI 6 n, forwarded like any output) and starts its console there, so
   // a program that draws from its console cursor row draws below what the
   // shell left on screen instead of over it. The report comes back on stdin
-  // and is forwarded like any input.
+  // (after the answers to the cell-size queries) and is forwarded like any
+  // input.
   const spawned = spawnChild({
     file: resolved.file,
     args: resolved.args,
@@ -197,26 +220,25 @@ async function main(argv: readonly string[]): Promise<void> {
   child = spawned
   log(`spawned at ${cols}x${rows}, bundled conpty ${spawned.bundledConpty}, inherit cursor ${options.inheritCursor}`)
 
-  // Input for the child. Answers to the startup queries that missed the
-  // window are still witty's (the terminal answers in order) and are taken
-  // out; later ones went to whoever asked (the child) and pass on. Either
-  // way they keep the cell size current.
-  const replies = new ReplyFilter(learned.missing)
+  // Input for the child. The first answer of each kind is witty's (the
+  // queries went out before the child existed and the terminal answers in
+  // order) and is taken out; later ones went to whoever asked (the child)
+  // and pass on. Either way they keep the cell size current.
+  const replies = new ReplyFilter(STARTUP_KINDS)
   let replyTimer: ReturnType<typeof setTimeout> | undefined
   const forwardInput = (bytes: Uint8Array): void => {
     clearTimeout(replyTimer)
     const { forward, reports, consumed } = replies.push(bytes)
     if (reports.length > 0) {
       for (const report of reports) {
-        log(`reply ${describeReport(report)} (${consumed.includes(report) ? 'late answer to witty, consumed' : 'seen on input'})`)
+        log(`reply ${describeReport(report)} (${consumed.includes(report) ? 'answer to witty, consumed' : 'seen on input'})`)
       }
       const screen = { columns: process.stdout.columns || 0, rows: process.stdout.rows || 0 }
-      const next = trackCellSize({ cell, source: cellSource }, reports, screen)
-      if (next.cell.width !== cell.width || next.cell.height !== cell.height) {
-        cell = next.cell
-        cellSource = next.source
-        log(`cell size ${formatCell(cell)} (${cellSource}, seen on input)`)
+      const next = trackCellSize(size, reports, screen, consumed)
+      if (next.cell.width !== size.cell.width || next.cell.height !== size.cell.height || next.source !== size.source) {
+        log(`cell size ${formatCell(next.cell)} (${next.source}, seen on input)`)
       }
+      size = next
     }
     if (forward.length > 0) spawned.write(forward)
     if (replies.holding) {
@@ -227,7 +249,26 @@ async function main(argv: readonly string[]): Promise<void> {
       }, REPLY_HOLD_MS)
     }
   }
-  if (learned.leftover.length > 0) forwardInput(learned.leftover)
+
+  /** Resolves once no answer to the queries is owed, or ANSWER_DRAIN_MS after they went out. */
+  const answersIn = (): Promise<void> => {
+    const left = queriedAt + ANSWER_DRAIN_MS - Date.now()
+    if (replies.pending.size === 0 || left <= 0) return Promise.resolve()
+    log(`waiting up to ${left} ms for the answers still owed (${[...replies.pending].join(', ')})`)
+    return new Promise((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer)
+        process.stdin.off('data', check)
+        resolve()
+      }
+      // Runs after forwardInput, which was attached first.
+      const check = (): void => {
+        if (replies.pending.size === 0) done()
+      }
+      const timer = setTimeout(done, left)
+      process.stdin.on('data', check)
+    })
+  }
 
   // Flow control: stop reading the child while stdout is full or while a
   // kitty command is being handled; the child blocks on its full pipe.
@@ -254,7 +295,7 @@ async function main(argv: readonly string[]): Promise<void> {
     splitter: wire.splitter,
     engine: wire.engine,
     emitter: wire.emitter,
-    cellSize: () => cell,
+    cellSize,
     screen: () => ({ columns: process.stdout.columns || 0, rows: process.stdout.rows || 0 }),
     writeOut,
     writeChild: (data) => spawned.write(data),
@@ -304,6 +345,7 @@ async function main(argv: readonly string[]): Promise<void> {
     void pipeline
       .end()
       .catch((error: unknown) => log(`pipeline end: ${String(error)}`))
+      .then(answersIn)
       .then(() => {
         leave()
         // The empty write's callback runs once everything before it is flushed.

@@ -17,7 +17,7 @@ pseudo-console that passes the kitty APC sequences through and translating them 
 | Module | Job |
 |---|---|
 | `src/cli.ts` | arguments, environment, wiring |
-| `src/host/pty.ts` | spawn the child in node-pty with `useConptyDll: true` and `conptyInheritCursor: true` (see "Two consoles, one cursor"); forward input; resize |
+| `src/host/pty.ts` | spawn the child in node-pty with `useConptyDll: true` and `conptyInheritCursor: true` (see "Two consoles, one cursor"); forward input; resize; read its output as bytes (node-pty's socket switched to latin1, so nothing is decoded as UTF-8 and encoded again) |
 | `src/host/resolve.ts` | find the command on PATH (never the current directory); run `.cmd`/`.bat` through `cmd.exe` with arguments quoted so cmd cannot run them (see "Security") |
 | `src/host/console.ts` | raw mode on Node 24 already leaves the console input in VT mode (measured: mode 0x208); a hidden PowerShell P/Invoke fallback sets it on older Node |
 | `src/kitty/splitter.ts` | streaming splitter: output bytes → text runs and complete `ESC _ G … ESC \` commands, chunk-safe |
@@ -128,8 +128,8 @@ the child goes quiet; if it fires while a command is in flight, the flush queues
 `end()`, which also clears the timer. A held run is capped at 8 KiB (a 400-column row of cells
 with three diacritics fits); past that it is written out up to its last cell, which bounds both
 memory and the re-scan each chunk does of what is held. If the cell size is wrong, strips are
-misaligned: the `--log` file records `cell size WxH (terminal reply)`
-or `(fallback)` at startup.
+misaligned: the `--log` file records `cell size WxH (fallback, until the terminal answers)` at
+startup and a `cell size` line for every change after it.
 
 ## Transmission
 
@@ -297,24 +297,32 @@ Cell sizes are fractional end to end. xterm.js cells are fractional in CSS pixel
 `CSI 16 t` reply is rounded (Tabby says 10x20), so a strip of n cells at the rounded size is off by
 up to n/2 pixels; measured in Tabby, an 8-cell sprite came out about 8.5 cells wide. At startup witty
 sends `CSI 14 t` (text area in pixels, reply `CSI 4;h;w t`), `CSI 18 t` (text area in cells, reply
-`CSI 8;rows;cols t`) and `CSI 16 t` (cell in pixels, reply `CSI 6;h;w t`) together. It stops waiting
-once all three are in, 60 ms after the latest reply when some never come, or after 300 ms.
+`CSI 8;rows;cols t`) and `CSI 16 t` (cell in pixels, reply `CSI 6;h;w t`) together, then starts the
+child at once with `--cell` as the size. It does not wait for the answers: they come back on the
+input like anything else and replace `--cell` as they arrive. Waiting cost every start up to
+300 ms with a terminal that never answers (Tabby by default). A terminal that answers does so
+before it answers the child console's `CSI 6 n` (see "Two consoles, one cursor"), which that console
+waits for before it draws, so the child's output already gets the answered size.
 
-Preference:
+Preference, once the answers are in:
 1. `CSI 14 t` divided by the cell count: `pixelWidth / cols`, `pixelHeight / rows`, with cols and
    rows from `CSI 18 t`, else the console's own size;
 2. else the `CSI 16 t` reply;
 3. else `--cell` (decimals allowed, e.g. `9.375x20`).
 
-Replies seen later on the input are followed. The terminal answers in order, so the first reply of
-each kind witty asked for and has not yet seen is still witty's, however late: it is taken out of
-the input instead of reaching the child (while one is owed, a read ending in what can only be the
-start of it is held up to 100 ms for the rest). Every later reply went to the child, which asked.
-Only `ESC [` counts as the introducer, never a 0x9b byte, which in UTF-8 input is part of a
-character. A text area re-derives the cell size (divided by the cell count from the same batch, if
-any); a `CSI 16 t` reply replaces it, unless the current size came from the text area and the reply
-is only its rounding (within a pixel per side). Every reply and the chosen size, with three
-decimals, are logged (`cell size 9.373x20.000 (text area)`).
+Every reply on the input is followed. The queries go out before the child exists and the terminal
+answers in order, so the first reply of each kind is witty's, however late: it is taken out of the
+input instead of reaching the child (while one is owed, a read ending in what can only be the start
+of it is held up to 100 ms for the rest). Every later reply went to the child, which asked. Only
+`ESC [` counts as the introducer, never a 0x9b byte, which in UTF-8 input is part of a character.
+A text area re-derives the cell size, divided by the cell count from the same read, else by the
+console size; witty's own cell count, when it comes in a later read than witty's text area,
+re-derives it from that, so however the three answers are split the result is the preference
+above. A `CSI 16 t` reply replaces the size, unless that came from the text area and the reply is
+witty's own or only the text area's rounding (within a pixel per side). Every reply and every
+change of size, with three decimals, are logged (`cell size 9.373x20.000 (text area, seen on
+input)`). When the child exits within 300 ms of the queries, witty reads on until the answers still
+owed are in or the 300 ms are up, so they are not left for the shell to read.
 
 Geometry rounds cell boundaries, never cell sizes. A placement covers `round(columns*cw)` ×
 `round(rows*ch)` pixels. For a virtual placement the whole image is scaled to that box once, and

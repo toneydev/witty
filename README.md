@@ -87,7 +87,7 @@ Without witty the Image slot shows its alt text; with witty it shows the sprite.
 
 | Option | Meaning |
 |---|---|
-| `--cell WxH` | cell size in pixels when the terminal does not report it (default 10x20; decimals allowed, e.g. `9.375x20`). witty asks `CSI 14 t` and `CSI 18 t` (exact, fractional) and `CSI 16 t` (rounded) first |
+| `--cell WxH` | cell size in pixels when the terminal does not report it (default 10x20; decimals allowed, e.g. `9.375x20`). witty asks `CSI 14 t` and `CSI 18 t` (exact, fractional) and `CSI 16 t` (rounded) at startup and switches to the answers as they arrive |
 | `--no-force` | do not set `CLAUDE_CODE_FORCE_TERMINAL_IMAGES` for the command |
 | `--no-inherit-cursor` | start the command's console with its cursor at the top-left. By default witty's ConPTY asks the terminal where its cursor is (`CSI 6 n`) and starts the console there, so Claude Code, which draws from its console cursor row, draws below what the shell left on screen instead of over it |
 | `--no-files` | refuse the file transports (`t=f`, `t=t`); by default witty reads only absolute local regular files, with a size check, a timeout and no file-system oracle (see SECURITY.md) |
@@ -99,8 +99,9 @@ Without witty the Image slot shows its alt text; with witty it shows the sprite.
 Switches take no value (`--no-files=false` is an error), and an option's value given as the next
 argument cannot start with `--`; write `--log=--odd-name` for that.
 
-If placeholder images look misaligned, run with `--debug` and check the `cell size` line near the
-top of the log: `(fallback)` means the terminal did not report its cell size and `--cell` is in use.
+If placeholder images look misaligned, run with `--debug` and check the `cell size` lines in the
+log: the first, `(fallback, until the terminal answers)`, is `--cell`; if no other follows it, the
+terminal did not report its cell size and `--cell` stays in use.
 
 ## How it works
 

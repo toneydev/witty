@@ -55,6 +55,19 @@ function startWittyWith(rest: string[], options: OuterOptions = {}) {
 }
 
 const childInput = (outer: Outer) => inputLines(outer.output()).join('')
+/** Everything the child read, as text. */
+const childText = (outer: Outer) => Buffer.from(childInput(outer), 'hex').toString('latin1')
+
+/** The log's `cell size` entries, in order, without their timestamps. */
+const cellSizes = (log: string) => [...log.matchAll(/\] cell size (.+)$/gm)].map((m) => m[1])
+const FALLBACK = '8.000x16.000 (fallback, until the terminal answers)'
+
+/** Asserts that `a` comes before `b` in `text` (both present). */
+function assertBefore(text: string, a: string, b: string, message: string): void {
+  const i = text.indexOf(a)
+  const j = text.indexOf(b)
+  assert.ok(i >= 0 && j >= 0 && i < j, `${message}: ${JSON.stringify(a)} at ${i}, ${JSON.stringify(b)} at ${j}`)
+}
 
 /** Polls until the child has reported reading `bytes`. */
 async function waitForInput(outer: Outer, bytes: string, timeoutMs = 10000): Promise<void> {
@@ -117,7 +130,9 @@ describe('witty end to end', { concurrency: true }, () => {
     assert.equal(await withTimeout(outer.exited, 15000, 'witty exit'), 42)
 
     const log = readLog()
-    assert.match(log, /cell size 9\.000x17\.000 \(terminal reply\)/)
+    // Only CSI 16 t is answered: its size replaces the fallback.
+    assert.equal(cellSizes(log)[0], FALLBACK)
+    assert.equal(cellSizes(log).at(-1), '9.000x17.000 (terminal reply, seen on input)')
     assert.match(log, /apc a=T,f=100,i=7 \(payload 4 bytes\)/)
     assert.match(log, /resize 100x30/)
     assert.match(log, /child exited with 42/)
@@ -131,24 +146,52 @@ describe('witty end to end', { concurrency: true }, () => {
     await waitForInput(outer, 'EARLY')
     outer.write('QUIT')
     assert.equal(await withTimeout(outer.exited, 15000, 'witty exit'), 42)
-    assert.match(readLog(), /cell size 8\.000x16\.000 \(fallback\), 5 leftover input bytes/)
+    const log = readLog()
+    assert.deepEqual(cellSizes(log), [FALLBACK])
+    assert.doesNotMatch(log, /\] reply /)
   })
 
-  it('consumes a late-split cell reply and keeps the bytes around it', async () => {
+  it('consumes an answer split across reads and keeps the bytes around it, in order', async () => {
     const { outer, readLog } = startWitty()
     await outer.waitFor('\x1b[16t', 30000)
     outer.write('ab\x1b[6;18;')
-    await new Promise((r) => setTimeout(r, 30))
+    await new Promise((r) => setTimeout(r, 20))
     outer.write('11tcd')
     await outer.waitFor('READY', 30000)
     await waitForInput(outer, 'cd')
     outer.write('QUIT')
     assert.equal(await withTimeout(outer.exited, 15000, 'witty exit'), 42)
-    assert.match(readLog(), /cell size 11\.000x18\.000 \(terminal reply\), 4 leftover input bytes/)
-    assert.ok(!childInput(outer).includes(hex('\x1b[6;18;11t')), 'the reply reached the child')
+    const input = childText(outer)
+    assert.ok(!input.includes('\x1b[6;18;'), `the answer reached the child: ${JSON.stringify(input)}`)
+    assertBefore(input, 'ab', 'cd', 'the bytes around the answer')
+    const log = readLog()
+    assert.match(log, /reply cell 11x18 px \(CSI 16 t\) \(answer to witty, consumed\)/)
+    assert.equal(cellSizes(log).at(-1), '11.000x18.000 (terminal reply, seen on input)')
   })
 
-  it('derives a fractional cell from CSI 14 t / 18 t and prefers it over CSI 16 t', async () => {
+  it('takes answers mixed with typing out of the input, and divides the text area by the cell count read after it', async () => {
+    // The console is 80x24, so until its cell count comes the text area is divided by that.
+    const { outer, readLog } = startWitty()
+    await outer.waitFor('\x1b[16t', 30000)
+    outer.write('one\x1b[4;760;1481t')
+    await new Promise((r) => setTimeout(r, 20))
+    outer.write('two\x1b[8;38;158t')
+    await new Promise((r) => setTimeout(r, 20))
+    outer.write('\x1b[6;20;9tsix')
+    await outer.waitFor('READY', 30000)
+    await waitForInput(outer, 'six')
+    outer.write('QUIT')
+    assert.equal(await withTimeout(outer.exited, 15000, 'witty exit'), 42)
+    const input = childText(outer)
+    for (const reply of ['\x1b[4;', '\x1b[8;', '\x1b[6;']) {
+      assert.ok(!input.includes(reply), `${JSON.stringify(reply)} reached the child: ${JSON.stringify(input)}`)
+    }
+    assertBefore(input, 'one', 'two', 'typing around the answers')
+    assertBefore(input, 'two', 'six', 'typing around the answers')
+    assert.equal(cellSizes(readLog()).at(-1), '9.373x20.000 (text area, seen on input)')
+  })
+
+  it('starts the child without waiting for the answers, then derives a fractional cell from CSI 14 t / 18 t over CSI 16 t', async () => {
     // xterm.js-like: 1481 px over 158 columns is 9.373 px per cell; its 16 t reply is rounded.
     const { outer, readLog } = startWitty({
       cols: 158,
@@ -161,10 +204,13 @@ describe('witty end to end', { concurrency: true }, () => {
     outer.write('QUIT')
     assert.equal(await withTimeout(outer.exited, 15000, 'witty exit'), 42)
     const log = readLog()
-    assert.match(log, /reply text area 1481x760 px \(CSI 14 t\)/)
-    assert.match(log, /reply text area 158x38 cells \(CSI 18 t\)/)
-    assert.match(log, /reply cell 9x20 px \(CSI 16 t\)/)
-    assert.match(log, /cell size 9\.373x20\.000 \(text area\), 0 leftover input bytes/)
+    assert.match(log, /reply text area 1481x760 px \(CSI 14 t\) \(answer to witty, consumed\)/)
+    assert.match(log, /reply text area 158x38 cells \(CSI 18 t\) \(answer to witty, consumed\)/)
+    assert.match(log, /reply cell 9x20 px \(CSI 16 t\) \(answer to witty, consumed\)/)
+    // The terminal answers at once, yet the child was already spawned: nothing waited for the answers.
+    assertBefore(log, 'spawned at', '] reply ', 'spawn and the answers')
+    assert.equal(cellSizes(log)[0], FALLBACK)
+    assert.equal(cellSizes(log).at(-1), '9.373x20.000 (text area, seen on input)')
     for (const reply of ['\x1b[4;760;1481t', '\x1b[8;38;158t', '\x1b[6;20;9t']) {
       assert.ok(!childInput(outer).includes(hex(reply)), `${JSON.stringify(reply)} reached the child`)
     }
@@ -193,7 +239,7 @@ describe('witty end to end', { concurrency: true }, () => {
     await outer.waitFor('READY', 30000)
     outer.write('QUIT')
     assert.equal(await withTimeout(outer.exited, 15000, 'witty exit'), 42)
-    assert.match(readLog(), /cell size 9\.373x20\.000 \(text area\)/)
+    assert.equal(cellSizes(readLog()).at(-1), '9.373x20.000 (text area, seen on input)')
   })
 
   it('keeps the child exit code when input arrives after the child has exited', async () => {
@@ -231,8 +277,8 @@ describe('witty end to end', { concurrency: true }, () => {
     assert.match(readLog(), /could not start/)
   })
 
-  it('takes answers to its own queries that miss the window out of the input, and forwards later ones', async () => {
-    // A slow terminal: nothing within the window, then all three answers at once.
+  it('takes answers to its own queries out of the input however late they come, and forwards later ones', async () => {
+    // A slow terminal: nothing until the child is up, then all three answers at once.
     const { outer, readLog } = startWitty({ cols: 158, rows: 38 })
     await outer.waitFor('READY', 30000)
     outer.write('\x1b[4;760;1481t\x1b[8;38;158t\x1b[6;20;9tlate')
@@ -246,9 +292,9 @@ describe('witty end to end', { concurrency: true }, () => {
     assert.ok(!childInput(outer).includes(hex('\x1b[8;38;158t')), 'a late answer reached the child')
     assert.equal(childInput(outer).split(hex('\x1b[6;20;9t')).length - 1, 1, 'exactly the second CSI 6 t reaches the child')
     const log = readLog()
-    assert.match(log, /cell size 8\.000x16\.000 \(fallback\)/)
-    assert.match(log, /reply cell 9x20 px \(CSI 16 t\) \(late answer to witty, consumed\)/)
-    assert.match(log, /cell size 9\.373x20\.000 \(text area, seen on input\)/)
+    assert.match(log, /reply cell 9x20 px \(CSI 16 t\) \(answer to witty, consumed\)/)
+    assert.match(log, /reply cell 9x20 px \(CSI 16 t\) \(seen on input\)/)
+    assert.deepEqual(cellSizes(log), [FALLBACK, '9.373x20.000 (text area, seen on input)'])
   })
 
   it('on Ctrl+Break kills the child and leaves the normal way, with its exit code', async () => {

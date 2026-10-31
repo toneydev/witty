@@ -1,11 +1,11 @@
-// The child pty wrapper: exit codes, a child that never started, and input
-// written after the child is gone.
+// The child pty wrapper: exit codes, a child that never started, input
+// written after the child is gone, and output read as bytes.
 
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { describe, it } from 'node:test'
 import type { IPty } from 'node-pty'
-import { settleExitCode, spawnChild, watchInput, type ChildPty } from '../src/host/pty.ts'
+import { readOutputAsBytes, settleExitCode, spawnChild, watchInput, type ChildPty } from '../src/host/pty.ts'
 
 /** A stand-in for node-pty's IPty with the agent field settleExitCode reads. */
 function fakePty(agent: { exitCode?: number | undefined }): IPty {
@@ -46,23 +46,36 @@ describe('settleExitCode', () => {
   })
 })
 
-/** A node-pty stand-in for spawnChild: an input socket that can fail, and recorded writes. */
-function fakeNodePty(pid: number) {
+/**
+ * A node-pty stand-in for spawnChild: an input socket that can fail, recorded
+ * writes, and output emitted on demand (with `setEncoding` only when asked).
+ */
+function fakeNodePty(pid: number, options: { setEncoding?: boolean } = {}) {
   const inSocket = new EventEmitter()
   const writes: string[] = []
   const exits: Array<(e: { exitCode: number }) => void> = []
+  const dataListeners: Array<(text: string) => void> = []
+  const encodings: Array<string | null> = []
   const pty = {
     pid,
     _agent: { inSocket },
     write: (data: string | Buffer) => void writes.push(String(data)),
     onExit: (cb: (e: { exitCode: number }) => void) => void exits.push(cb),
-    onData: () => {},
+    onData: (cb: (text: string) => void) => void dataListeners.push(cb),
+    ...(options.setEncoding === true ? { setEncoding: (encoding: string | null) => void encodings.push(encoding) } : {}),
     resize: () => {},
     pause: () => {},
     resume: () => {},
     kill: () => {},
   }
-  return { pty, inSocket, writes, exit: (code: number) => exits.forEach((cb) => cb({ exitCode: code })) }
+  return {
+    pty,
+    inSocket,
+    writes,
+    encodings,
+    exit: (code: number) => exits.forEach((cb) => cb({ exitCode: code })),
+    emit: (text: string) => dataListeners.forEach((cb) => cb(text)),
+  }
 }
 
 describe('spawnChild', () => {
@@ -88,6 +101,69 @@ describe('spawnChild', () => {
   it('watchInput reports false when the socket is not where node-pty keeps it', () => {
     assert.equal(watchInput({} as unknown as IPty, () => {}), false)
     assert.equal(watchInput({ _agent: {} } as unknown as IPty, () => {}), false)
+  })
+
+  it('reads the output as bytes: node-pty is switched to latin1 strings, each char one byte', () => {
+    const fake = fakeNodePty(1234, { setEncoding: true })
+    const child = spawnChild({ file: 'x.exe', args: '', cwd: '.', env: {}, cols: 80, rows: 24, spawn: () => fake.pty as unknown as IPty })
+    assert.deepEqual(fake.encodings, ['latin1'])
+    const reads: Uint8Array[] = []
+    child.onData((bytes) => reads.push(bytes))
+    // "é─" as UTF-8 (C3 A9 E2 94 80), split inside the second character, as latin1 strings.
+    fake.emit('A\xc3\xa9\xe2')
+    fake.emit('\x94\x80Z')
+    assert.deepEqual(reads.map((r) => [...r]), [
+      [0x41, 0xc3, 0xa9, 0xe2],
+      [0x94, 0x80, 0x5a],
+    ])
+  })
+
+  it("re-encodes node-pty's UTF-8 strings when it cannot switch the encoding", () => {
+    const fake = fakeNodePty(1234)
+    const child = spawnChild({ file: 'x.exe', args: '', cwd: '.', env: {}, cols: 80, rows: 24, spawn: () => fake.pty as unknown as IPty })
+    const reads: Uint8Array[] = []
+    child.onData((bytes) => reads.push(bytes))
+    fake.emit('Aé─')
+    assert.deepEqual(reads.map((r) => [...r]), [[0x41, 0xc3, 0xa9, 0xe2, 0x94, 0x80]])
+  })
+
+  it('readOutputAsBytes reports false when node-pty has no setEncoding or it throws', () => {
+    assert.equal(readOutputAsBytes({} as unknown as IPty), false)
+    const throwing = {
+      setEncoding: () => {
+        throw new Error('no')
+      },
+    }
+    assert.equal(readOutputAsBytes(throwing as unknown as IPty), false)
+  })
+
+  // The real thing: non-ASCII output through the bundled ConPTY comes out as
+  // its UTF-8 bytes, whatever the read boundaries.
+  it('passes non-ASCII output through as its UTF-8 bytes', { timeout: 60000 }, async () => {
+    const expected = 'Aé─中Z'
+    const child: ChildPty = spawnChild({
+      file: process.execPath,
+      args: '-e process.stdout.write(String.fromCodePoint(0x41,0xe9,0x2500,0x4e2d,0x5a))',
+      cwd: process.cwd(),
+      env: process.env,
+      cols: 80,
+      rows: 24,
+      inheritCursor: false,
+    })
+    const reads: Uint8Array[] = []
+    let answered = false
+    const exited = new Promise<number>((resolve) => child.onExit(resolve))
+    child.onData((bytes) => {
+      reads.push(bytes)
+      // The ConPTY asks for the terminal's attributes (DA1) and waits about 3 s for an answer.
+      if (!answered) {
+        answered = true
+        child.write('\x1b[?61;4c')
+      }
+    })
+    assert.equal(await exited, 0)
+    const text = Buffer.concat(reads).toString('utf8')
+    assert.ok(text.includes(expected), `output ${JSON.stringify(text)}`)
   })
 
   // The real thing. Writing between the child's exit and node-pty's 'exit'

@@ -1,39 +1,46 @@
-// Cell-size reply parsing, `--cell` parsing, and learnCellSize's handling of
-// input that arrives around the reply.
+// Cell-size reply parsing, `--cell` parsing, following the size reports seen
+// on the input (witty's own answers, however they are split, and the
+// child's), and taking witty's answers out of the input.
 
 import assert from 'node:assert/strict'
-import { EventEmitter } from 'node:events'
 import { describe, it } from 'node:test'
+import type { CellSize } from '../src/types.ts'
 import {
   CELL_SIZE_QUERY,
   STARTUP_QUERIES,
   TEXT_AREA_QUERY,
   TEXT_CELLS_QUERY,
-  chooseCellSize,
   deriveCellSize,
   formatCell,
-  learnCellSize,
   parseCellOption,
   parseCellSizeReply,
   parseWindowReports,
   ReplyFilter,
   STARTUP_KINDS,
   trackCellSize,
-  type ByteSource,
+  type TrackedCellSize,
 } from '../src/term/metrics.ts'
 
 const bytes = (s: string) => Buffer.from(s, 'latin1')
+const text = (b: Uint8Array) => Buffer.from(b).toString('latin1')
 
-/** A fake stdin: emit chunks with `send`; records pause(). */
-class FakeInput extends EventEmitter implements ByteSource {
-  paused = false
-  pause() {
-    this.paused = true
-    return this
+/**
+ * Feeds `reads` through a ReplyFilter owing all three startup answers and
+ * trackCellSize, as cli.ts does. Returns the size after each read and
+ * everything forwarded to the child.
+ */
+function follow(reads: readonly string[], screen: { columns: number; rows: number }, fallback: CellSize = { width: 8, height: 16 }) {
+  const filter = new ReplyFilter(STARTUP_KINDS)
+  let size: TrackedCellSize = { cell: fallback, source: 'fallback' }
+  const sizes: TrackedCellSize[] = []
+  let forwarded = ''
+  for (const read of reads) {
+    const { forward, reports, consumed } = filter.push(bytes(read))
+    forwarded += text(forward)
+    size = trackCellSize(size, reports, screen, consumed)
+    sizes.push(size)
   }
-  send(s: string) {
-    this.emit('data', bytes(s))
-  }
+  return { size, sizes, forwarded }
 }
 
 describe('parseCellSizeReply', () => {
@@ -97,21 +104,18 @@ describe('size reports', () => {
     assert.deepEqual([reports[0]!.start, reports[0]!.end], [1, 14])
   })
 
-  it('derives the cell from the text area, preferring it over CSI 16 t', () => {
-    const reports = parseWindowReports(bytes('\x1b[6;20;9t\x1b[4;760;1481t\x1b[8;38;158t'))
-    const chosen = chooseCellSize(reports, { columns: 80, rows: 24 })
-    assert.equal(chosen?.source, 'text area')
-    assert.equal(chosen?.cell.width, 1481 / 158)
-    assert.equal(chosen?.cell.height, 20)
-    assert.equal(formatCell(chosen!.cell), '9.373x20.000')
-    // Without CSI 18 t the console's own size divides the text area.
-    const noCells = chooseCellSize(parseWindowReports(bytes('\x1b[4;760;1481t\x1b[6;20;9t')), { columns: 158, rows: 38 })
-    assert.deepEqual(noCells, { cell: { width: 1481 / 158, height: 20 }, source: 'text area' })
-    // Only CSI 16 t, or a text area with no known cell count: the 16 t reply.
-    assert.deepEqual(chooseCellSize(parseWindowReports(bytes('\x1b[6;20;9t')), undefined), { cell: { width: 9, height: 20 }, source: 'terminal reply' })
-    assert.equal(chooseCellSize(parseWindowReports(bytes('\x1b[4;760;1481t\x1b[6;20;9t')), { columns: 0, rows: 0 })?.source, 'terminal reply')
-    assert.equal(chooseCellSize([], undefined), undefined)
+  it('asks for the text area, its cell count and the cell size, in that order', () => {
+    assert.equal(STARTUP_QUERIES, TEXT_AREA_QUERY + TEXT_CELLS_QUERY + CELL_SIZE_QUERY)
+    assert.equal(STARTUP_QUERIES, '\x1b[14t\x1b[18t\x1b[16t')
+    assert.deepEqual(STARTUP_KINDS, ['text-area', 'cells', 'cell'])
+  })
+
+  it('derives a fractional cell from a text area and its cell count', () => {
+    const cell = deriveCellSize({ width: 1481, height: 760 }, { columns: 158, rows: 38 })
+    assert.deepEqual(cell, { width: 1481 / 158, height: 20 })
+    assert.equal(formatCell(cell!), '9.373x20.000')
     assert.equal(deriveCellSize({ width: 100, height: 100 }, { columns: 0, rows: 5 }), undefined)
+    assert.equal(deriveCellSize({ width: 0, height: 100 }, { columns: 10, rows: 5 }), undefined)
   })
 
   it('tracks reports seen later: keeps an exact size against its rounding, follows real changes', () => {
@@ -138,8 +142,6 @@ describe('size reports', () => {
 })
 
 describe('ReplyFilter', () => {
-  const text = (b: Uint8Array) => Buffer.from(b).toString('latin1')
-
   it('consumes the first report of each owed kind and forwards later ones', () => {
     const filter = new ReplyFilter(STARTUP_KINDS)
     const first = filter.push(bytes('a\x1b[4;760;1481tb\x1b[8;38;158t\x1b[6;20;9tc'))
@@ -187,6 +189,16 @@ describe('ReplyFilter', () => {
     }
   })
 
+  it('keeps UTF-8 typed while the answers are owed intact, 0x9b bytes and all', () => {
+    const filter = new ReplyFilter(STARTUP_KINDS)
+    const typed = Buffer.from('ńŁ ść Û6;20;10t ok 💛4;1;1t ě8;12;30t', 'utf8')
+    const r = filter.push(typed)
+    assert.deepEqual(Buffer.from(r.forward), typed)
+    assert.deepEqual(r.reports, [])
+    assert.equal(filter.pending.size, 3)
+    assert.equal(filter.holding, false)
+  })
+
   it('passes everything through untouched when nothing is owed', () => {
     const filter = new ReplyFilter([])
     const chunk = bytes('\x1b[6;20;9t\x1b[6;2')
@@ -197,84 +209,78 @@ describe('ReplyFilter', () => {
   })
 })
 
-describe('learnCellSize', () => {
-  it('sends the query and returns the reply, keeping other input as leftover', async () => {
-    const input = new FakeInput()
-    const written: string[] = []
-    const p = learnCellSize({ input, write: (s) => written.push(s), timeoutMs: 1000 })
-    assert.deepEqual(written, [STARTUP_QUERIES])
-    assert.equal(STARTUP_QUERIES, TEXT_AREA_QUERY + TEXT_CELLS_QUERY + CELL_SIZE_QUERY)
-    input.send('hi\x1b[6;1')
-    input.send('7;9tthere')
-    const r = await p
-    assert.deepEqual(r.cell, { width: 9, height: 17 })
-    assert.equal(r.fromTerminal, true)
-    assert.equal(Buffer.from(r.leftover).toString('latin1'), 'hithere')
-    assert.equal(input.paused, true)
-    assert.equal(input.listenerCount('data'), 0)
+describe("witty's own answers, however they are split", () => {
+  // The terminal's text area is 158x38 cells; the console size passed as the screen is not.
+  const exact: TrackedCellSize = { cell: { width: 1481 / 158, height: 20 }, source: 'text area' }
+  const answers = '\x1b[4;760;1481t\x1b[8;38;158t\x1b[6;20;9t'
+
+  it('picks the text area divided by its cell count when all three come in one read', () => {
+    const { size, forwarded } = follow([answers], { columns: 80, rows: 24 })
+    assert.deepEqual(size, exact)
+    assert.equal(forwarded, '')
   })
 
-  it('falls back after the timeout and keeps everything read', async () => {
-    const input = new FakeInput()
-    const started = Date.now()
-    const p = learnCellSize({ input, write: () => {}, fallback: { width: 7, height: 14 }, timeoutMs: 80 })
-    input.send('typed early')
-    const r = await p
-    assert.ok(Date.now() - started >= 70)
-    assert.deepEqual(r, {
-      cell: { width: 7, height: 14 },
-      fromTerminal: false,
-      source: 'fallback',
-      reports: [],
-      missing: new Set(['text-area', 'cells', 'cell']),
-      leftover: r.leftover,
+  it('ends at the same size when they are split across reads, with typing around them', () => {
+    const splits = [
+      ['\x1b[4;760;1481t', '\x1b[8;38;158t', '\x1b[6;20;9t'],
+      ['\x1b[4;760;1481t\x1b[8;38;158t', '\x1b[6;20;9t'],
+      ['\x1b[4;760;1481t', '\x1b[8;38;158t\x1b[6;20;9t'],
+      ['a\x1b[4;760;14', '81tb\x1b[8;38;1', '58tc\x1b[6;2', '0;9td'],
+      ['a\x1b[4;760;1481tb', 'c', '\x1b[8;38;158t', 'd\x1b[6;20;9t'],
+    ]
+    for (const reads of splits) {
+      const { size, forwarded } = follow(reads, { columns: 80, rows: 24 })
+      assert.deepEqual(size, exact, JSON.stringify(reads))
+      assert.equal(forwarded, reads.join('').replace(/\x1b\[[468];\d+;\d+t/g, ''), JSON.stringify(reads))
+    }
+  })
+
+  it('divides a text area that comes before its cell count by the console size, then by the count', () => {
+    const { sizes } = follow(['\x1b[4;760;1481t', '\x1b[8;38;158t', '\x1b[6;20;9t'], { columns: 80, rows: 24 })
+    assert.deepEqual(sizes[0], { cell: { width: 1481 / 80, height: 760 / 24 }, source: 'text area', area: { width: 1481, height: 760 } })
+    assert.deepEqual(sizes[1], exact)
+    assert.deepEqual(sizes[2], exact)
+  })
+
+  it('waits for the cell count when the console size is unknown', () => {
+    const { sizes } = follow(['\x1b[4;760;1481t', '\x1b[8;38;158t'], { columns: 0, rows: 0 })
+    assert.deepEqual(sizes[0], { cell: { width: 8, height: 16 }, source: 'fallback', area: { width: 1481, height: 760 } })
+    assert.deepEqual(sizes[1], exact)
+  })
+
+  it('keeps the text area against its own 16 t answer even when that is more than rounding; a later one replaces it', () => {
+    const { sizes } = follow(['\x1b[4;760;1481t\x1b[8;38;158t', '\x1b[6;24;12t', '\x1b[6;24;12t'], { columns: 80, rows: 24 })
+    assert.deepEqual(sizes[1], exact, "witty's own 16 t answer")
+    assert.deepEqual(sizes[2], { cell: { width: 12, height: 24 }, source: 'terminal reply' }, "the child's")
+  })
+
+  it('without a text area takes the 16 t answer, and without that keeps the fallback', () => {
+    assert.deepEqual(follow(['\x1b[8;38;158t', '\x1b[6;20;9t'], { columns: 80, rows: 24 }).size, {
+      cell: { width: 9, height: 20 },
+      source: 'terminal reply',
     })
-    assert.equal(Buffer.from(r.leftover).toString('latin1'), 'typed early')
-    assert.equal(input.paused, true)
+    assert.deepEqual(follow(['\x1b[8;38;158t'], { columns: 80, rows: 24 }).size, { cell: { width: 8, height: 16 }, source: 'fallback' })
+    assert.deepEqual(follow(['typed'], { columns: 80, rows: 24 }).size, { cell: { width: 8, height: 16 }, source: 'fallback' })
   })
 
-  it('defaults to 10x20', async () => {
-    const r = await learnCellSize({ input: new FakeInput(), write: () => {}, timeoutMs: 10 })
-    assert.deepEqual(r.cell, { width: 10, height: 20 })
-    assert.equal(r.leftover.length, 0)
+  it('a text area with no cell count at all: divided by the console size, else the 16 t answer', () => {
+    assert.deepEqual(follow(['\x1b[4;760;1481t', '\x1b[6;20;9t'], { columns: 158, rows: 38 }).size, exact)
+    // The 16 t answer comes after any 18 t answer, so the text area stops waiting for one.
+    assert.deepEqual(follow(['\x1b[4;760;1481t', '\x1b[6;20;9t'], { columns: 0, rows: 0 }).size, {
+      cell: { width: 9, height: 20 },
+      source: 'terminal reply',
+    })
   })
 
-  it('resolves as soon as all three replies are in, preferring the text area; replies split across chunks', async () => {
-    const input = new FakeInput()
-    const started = Date.now()
-    const p = learnCellSize({ input, write: () => {}, timeoutMs: 5000, settleMs: 5000, screen: () => ({ columns: 80, rows: 24 }) })
-    input.send('a\x1b[4;760;14')
-    input.send('81t\x1b[8;38;158tb\x1b[6;2')
-    input.send('0;9tc')
-    const r = await p
-    assert.ok(Date.now() - started < 1000)
-    assert.equal(r.source, 'text area')
-    assert.deepEqual(r.cell, { width: 1481 / 158, height: 20 })
-    assert.equal(r.fromTerminal, true)
-    assert.deepEqual(r.reports.map((x) => x.kind), ['text-area', 'cells', 'cell'])
-    assert.equal(Buffer.from(r.leftover).toString('latin1'), 'abc')
-  })
-
-  it('waits only settleMs for missing replies; a text area alone uses the screen size', async () => {
-    const input = new FakeInput()
-    const started = Date.now()
-    const p = learnCellSize({ input, write: () => {}, timeoutMs: 5000, settleMs: 30, screen: () => ({ columns: 158, rows: 38 }) })
-    input.send('\x1b[4;760;1481t')
-    const r = await p
-    assert.ok(Date.now() - started < 1000)
-    assert.deepEqual(r.cell, { width: 1481 / 158, height: 20 })
-    assert.equal(r.source, 'text area')
-    assert.deepEqual(r.missing, new Set(['cells', 'cell']), 'the answers still owed, for the ReplyFilter')
-  })
-
-  it('keeps UTF-8 typed during the window intact, 0x9b bytes and all', async () => {
-    const input = new FakeInput()
-    const p = learnCellSize({ input, write: () => {}, timeoutMs: 50, screen: () => ({ columns: 80, rows: 24 }) })
-    const typed = 'ńŁ ść Û6;20;10t ok 💛4;1;1t'
-    input.emit('data', Buffer.from(typed, 'utf8'))
-    const r = await p
-    assert.equal(Buffer.from(r.leftover).toString('utf8'), typed)
-    assert.equal(r.source, 'fallback')
-    assert.equal(r.reports.length, 0)
+  it("re-derives only from witty's own cell count: the child's lone CSI 8 t (after a resize, say) changes nothing", () => {
+    const screen = { columns: 100, rows: 30 }
+    const resized = parseWindowReports(bytes('\x1b[8;30;100t'))
+    assert.deepEqual(trackCellSize(exact, resized, screen, []), exact)
+    const waiting: TrackedCellSize = { ...exact, area: { width: 1481, height: 760 } }
+    assert.deepEqual(trackCellSize(waiting, resized, screen, []), waiting)
+    assert.deepEqual(trackCellSize(waiting, resized, screen, resized), {
+      cell: { width: 14.81, height: 760 / 30 },
+      source: 'text area',
+    })
   })
 })
