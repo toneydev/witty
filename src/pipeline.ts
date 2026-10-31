@@ -199,7 +199,8 @@ export function createPipeline(options: PipelineOptions): Pipeline {
   const apply = async (event: EngineEvent): Promise<void> => {
     switch (event.kind) {
       case 'place': {
-        log(`place image ${event.imageId} ${event.image.width}x${event.image.height} in ${event.columns}x${event.rows} cells, cursor ${event.cursor}`)
+        const { width, height } = event.source ?? event.image
+        log(`place image ${event.imageId} ${width}x${height} in ${event.columns}x${event.rows} cells, cursor ${event.cursor}`)
         await writeOut(emitter(event, cellSize(), options.screen?.()))
         break
       }

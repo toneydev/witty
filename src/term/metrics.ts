@@ -53,12 +53,14 @@ export type WindowReport = {
 const REPORT_KINDS = { '4': 'text-area', '6': 'cell', '8': 'cells' } as const
 
 /**
- * Every `CSI 4|6|8 ; a ; b t` report in `bytes` (7-bit `ESC [` or 8-bit 0x9b
- * introducer), in order. Reports with a zero dimension are skipped.
+ * Every `CSI 4|6|8 ; a ; b t` report in `bytes`, in order. Reports with a
+ * zero dimension are skipped. Only the 7-bit `ESC [` introducer counts: the
+ * input is UTF-8, where a 0x9b byte is always part of a character (Û, ě, Л,
+ * 💛 ...), and terminals in UTF-8 mode never send a raw 8-bit CSI.
  */
 export function parseWindowReports(bytes: Uint8Array): WindowReport[] {
   const text = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1')
-  const re = /(?:\x1b\[|\x9b)([468]);(\d{1,5});(\d{1,5})t/g
+  const re = /\x1b\[([468]);(\d{1,5});(\d{1,5})t/g
   const reports: WindowReport[] = []
   for (let m = re.exec(text); m !== null; m = re.exec(text)) {
     const height = Number(m[2])
@@ -146,9 +148,18 @@ export type LearnedCellSize = {
   source: CellSource
   /** Every size report received, in order. */
   reports: WindowReport[]
+  /**
+   * The kinds asked for that did not come back in time. The terminal answers
+   * in order, so the first such reply seen later is still witty's (see
+   * {@link ReplyFilter}).
+   */
+  missing: Set<WindowReport['kind']>
   /** Everything else read meanwhile (user typing, other replies), to forward to the child. */
   leftover: Uint8Array
 }
+
+/** The kinds of report the startup queries ask for. */
+export const STARTUP_KINDS: readonly WindowReport['kind'][] = ['text-area', 'cells', 'cell']
 
 /**
  * Picks the cell size from `reports`: the last text area in pixels divided
@@ -204,11 +215,14 @@ export function learnCellSize(options: LearnCellSizeOptions = {}): Promise<Learn
       input.off('data', onData)
       input.pause()
       const chosen = chooseCellSize(reports, screen())
+      const missing = new Set(STARTUP_KINDS)
+      for (const report of reports) missing.delete(report.kind)
       resolve({
         cell: chosen?.cell ?? fallback,
         fromTerminal: chosen !== undefined,
         source: chosen?.source ?? 'fallback',
         reports,
+        missing,
         leftover: buffered,
       })
     }
@@ -249,10 +263,13 @@ export function learnCellSize(options: LearnCellSizeOptions = {}): Promise<Learn
 }
 
 /**
- * Follows size reports seen on the input after startup (the child asked):
- * a text area in pixels re-derives the cell size; a CSI 16 t reply is taken
- * unless the current size came from the text area and the reply is just its
- * rounding (within a pixel per side).
+ * Follows size reports seen on the input after startup (the child asked, or
+ * late answers to witty's own queries): a text area in pixels re-derives the
+ * cell size, divided by the size in cells from the same batch (the last
+ * `CSI 8 t` in it, wherever it stands: the queries go out 14 t first, so its
+ * answer comes before the cell count it needs), else by `screen`; a CSI 16 t
+ * reply is taken unless the current size came from the text area and the
+ * reply is just its rounding (within a pixel per side).
  */
 export function trackCellSize(
   current: { cell: CellSize; source: CellSource },
@@ -262,8 +279,11 @@ export function trackCellSize(
   let state = current
   let cells: { columns: number; rows: number } = screen
   for (const report of reports) {
+    if (report.kind === 'cells') cells = { columns: report.width, rows: report.height }
+  }
+  for (const report of reports) {
     if (report.kind === 'cells') {
-      cells = { columns: report.width, rows: report.height }
+      continue
     } else if (report.kind === 'text-area') {
       const derived = deriveCellSize(report, cells)
       if (derived !== undefined) state = { cell: derived, source: 'text area' }
@@ -276,4 +296,80 @@ export function trackCellSize(
     }
   }
   return state
+}
+
+/** Which final parameter each report kind has: `CSI 4 ; ... t` and so on. */
+const KIND_DIGIT: Record<WindowReport['kind'], string> = { 'text-area': '4', cell: '6', cells: '8' }
+
+/**
+ * Takes the answers to witty's own startup queries out of the input after
+ * the startup window. The terminal answers in order, so the first report of
+ * each kind still owed ({@link LearnedCellSize.missing}) is witty's, however
+ * late it comes, and is consumed instead of forwarded; every later one goes
+ * to the child, which asked for it. While a kind is owed, a chunk that ends
+ * in what can only be the start of its report (`ESC [ 6 ;` and digits, which
+ * no key sends as a whole read) is held for the next chunk; `flush` hands it
+ * back if none comes.
+ */
+export class ReplyFilter {
+  private readonly owed: Set<WindowReport['kind']>
+  private held: Uint8Array = new Uint8Array(0)
+
+  constructor(owed: Iterable<WindowReport['kind']>) {
+    this.owed = new Set(owed)
+  }
+
+  /** The kinds whose answer has not come yet. */
+  get pending(): ReadonlySet<WindowReport['kind']> {
+    return this.owed
+  }
+
+  /** Whether the start of a report is held back. */
+  get holding(): boolean {
+    return this.held.length > 0
+  }
+
+  /**
+   * Splits one input chunk into the bytes to forward and the reports in it:
+   * all of them in order (`reports`, for {@link trackCellSize}) and the ones
+   * taken out as witty's own (`consumed`).
+   */
+  push(chunk: Uint8Array): { forward: Uint8Array; reports: WindowReport[]; consumed: WindowReport[] } {
+    if (this.owed.size === 0 && this.held.length === 0) {
+      return { forward: chunk, reports: parseWindowReports(chunk), consumed: [] }
+    }
+    const joined = this.held.length === 0 ? chunk : new Uint8Array(Buffer.concat([this.held, chunk]))
+    this.held = new Uint8Array(0)
+    const reports = parseWindowReports(joined)
+    const parts: Uint8Array[] = []
+    const consumed: WindowReport[] = []
+    let from = 0
+    for (const report of reports) {
+      if (!this.owed.delete(report.kind)) continue
+      consumed.push(report)
+      parts.push(joined.subarray(from, report.start))
+      from = report.end
+    }
+    let rest = joined.subarray(from)
+    if (this.owed.size > 0) {
+      const digits = [...this.owed].map((kind) => KIND_DIGIT[kind]).join('')
+      const tailLength = Math.min(rest.length, 16)
+      const tail = Buffer.from(rest.buffer, rest.byteOffset + rest.length - tailLength, tailLength).toString('latin1')
+      const m = new RegExp(`\\x1b\\[[${digits}];\\d{0,5}(?:;\\d{0,5})?$`).exec(tail)
+      if (m !== null) {
+        this.held = rest.slice(rest.length - m[0].length)
+        rest = rest.subarray(0, rest.length - m[0].length)
+      }
+    }
+    parts.push(rest)
+    const forward = parts.length === 1 ? (parts[0] as Uint8Array) : new Uint8Array(Buffer.concat(parts))
+    return { forward, reports, consumed }
+  }
+
+  /** Gives back whatever is held (nothing when nothing is). */
+  flush(): Uint8Array {
+    const held = this.held
+    this.held = new Uint8Array(0)
+    return held
+  }
 }

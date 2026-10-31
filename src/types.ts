@@ -52,9 +52,11 @@ export type CursorPolicy = 'move' | 'stay'
 /**
  * What the engine asks the terminal side to do, in order.
  *
- * `place`: draw `image` over a box of `columns` × `rows` cells at the cursor
- * (the image is already the right source; the emitter scales it to the box).
- * `cursor: 'move'` means leave the cursor to the right of the image's
+ * `place`: draw `image`, or its `source` rectangle when present, over a box
+ * of `columns` × `rows` cells at the cursor (the emitter cuts and scales it to
+ * the box). `image` is the stored image itself (shared, never copied), so
+ * repeated puts of one image, cropped or not, are the same object and the
+ * emitter can reuse its encoded bytes. `cursor: 'move'` means leave the cursor to the right of the image's
  * bottom-right cell afterwards, `'stay'` means put it back where it was.
  *
  * `respond`: write `data` to the child's input, verbatim (a full
@@ -76,7 +78,7 @@ export type CursorPolicy = 'move' | 'stay'
  * `log`: a diagnostic line for `--debug`.
  */
 export type EngineEvent =
-  | { kind: 'place'; image: Rgba; columns: number; rows: number; cursor: CursorPolicy; imageId: number }
+  | { kind: 'place'; image: Rgba; source?: SourceRect; columns: number; rows: number; cursor: CursorPolicy; imageId: number }
   | { kind: 'virtual'; imageId: number; placementId: number | undefined; image: Rgba; source?: SourceRect; columns: number; rows: number }
   | { kind: 'respond'; data: string }
   | { kind: 'delete'; imageIds: number[]; virtual?: VirtualPlacementKey[] }

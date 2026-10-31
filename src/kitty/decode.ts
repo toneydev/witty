@@ -36,7 +36,8 @@ const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
  * (offset) and `S` (size). Once the medium is a file, every failure (path,
  * read, range, inflate, PNG, raw size) is `EBADF:Failed to read image file`,
  * so the response says nothing about the file beyond whether it decoded as
- * the image the command describes. A `t=t` file is offered to
+ * the image the command describes. A chunked payload (`m=1`) comes as its
+ * chunks, each of which may end in its own base64 padding. A `t=t` file is offered to
  * `options.deleteFile` after the read attempt only when its basename contains
  * `tty-graphics-protocol` (the deleter applies the rest of the policy, see
  * files.ts). `t=s` is refused.
@@ -46,7 +47,7 @@ const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
  */
 export async function decodeImage(
   keys: Record<string, string>,
-  payload: string,
+  payload: string | readonly string[],
   options: DecodeOptions = {},
 ): Promise<Rgba> {
   const maxImageBytes = options.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES
@@ -61,15 +62,29 @@ export async function decodeImage(
   }
 
   const decode = (transmitted: Uint8Array): Rgba => {
-    const data = compression === 'z' ? inflate(transmitted, maxImageBytes) : transmitted
-    if (format === '100') return decodePng(data, maxImageBytes)
-    return decodeRaw(data, format === '24' ? 3 : 4, keys, maxImageBytes)
+    if (format === '100') {
+      return decodePng(compression === 'z' ? inflate(transmitted, maxImageBytes) : transmitted, maxImageBytes)
+    }
+    const bpp = format === '24' ? 3 : 4
+    if (compression !== 'z') return decodeRaw(transmitted, bpp, keys, maxImageBytes)
+    // Compressed raw data must inflate to exactly s*v*bpp bytes, as in kitty:
+    // inflate no more than that, and more is a mismatch, not a size limit.
+    let data: Uint8Array
+    try {
+      data = inflate(transmitted, rawSize(keys, bpp, maxImageBytes))
+    } catch (error) {
+      if (error instanceof KittyError && error.code === 'EFBIG') {
+        throw new KittyError('EINVAL', 'inflated data does not match the image size')
+      }
+      throw error
+    }
+    return decodeRaw(data, bpp, keys, maxImageBytes)
   }
 
   const medium = keys.t === undefined || keys.t === '' ? 'd' : keys.t
   switch (medium) {
     case 'd':
-      if (payload.length > maxPayloadBytes) throw new KittyError('EFBIG', 'payload too large')
+      if (base64Length(payload) > maxPayloadBytes) throw new KittyError('EFBIG', 'payload too large')
       return decode(base64(payload))
     case 'f':
     case 't': {
@@ -100,7 +115,7 @@ function basenameOf(p: string): string {
 async function readFileData(
   medium: 'f' | 't',
   keys: Record<string, string>,
-  payload: string,
+  payload: string | readonly string[],
   options: DecodeOptions,
   maxImageBytes: number,
 ): Promise<Uint8Array> {
@@ -116,7 +131,8 @@ async function readFileData(
   } catch {
     throw fileReadFailed()
   }
-  const path = Buffer.from(payload, 'base64').toString('utf8')
+  const pathBytes = base64(payload)
+  const path = Buffer.from(pathBytes.buffer, pathBytes.byteOffset, pathBytes.length).toString('utf8')
   if (path === '' || path.includes('\0')) throw fileReadFailed()
 
   let file: Uint8Array
@@ -138,16 +154,51 @@ async function readFileData(
   return file.subarray(offset, size > 0 ? offset + size : file.length)
 }
 
-function base64(text: string): Uint8Array {
-  const buf = Buffer.from(text, 'base64')
-  return new Uint8Array(buf.buffer, buf.byteOffset, buf.length)
+function base64Length(payload: string | readonly string[]): number {
+  if (typeof payload === 'string') return payload.length
+  let length = 0
+  for (const chunk of payload) length += chunk.length
+  return length
+}
+
+/**
+ * Decodes base64 sent whole or in chunks. kitty decodes every chunk on its
+ * own, so each may end in padding (`AQIDBA==` then `BQYHCAk=`), which a decoder
+ * of the joined text would stop at; a chunk may also stop mid-quantum, and the
+ * 1–3 characters past its last whole quantum carry into the next.
+ */
+function base64(payload: string | readonly string[]): Uint8Array {
+  if (typeof payload === 'string' || payload.length === 1) {
+    const buf = Buffer.from(typeof payload === 'string' ? payload : payload[0]!, 'base64')
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.length)
+  }
+  const out = Buffer.allocUnsafeSlow(Math.ceil(base64Length(payload) / 4) * 3)
+  let used = 0
+  let carry = ''
+  for (const chunk of payload) {
+    const text = carry === '' ? chunk : carry + chunk
+    const whole = text.length - (text.length % 4)
+    if (whole > 0) used += out.write(text.slice(0, whole), used, 'base64')
+    carry = text.slice(whole)
+  }
+  if (carry !== '') used += out.write(carry, used, 'base64')
+  return new Uint8Array(out.buffer, out.byteOffset, used)
+}
+
+/** The size of raw `s`×`v` data at `bpp` bytes a pixel, checked as `decodeRaw` checks it. */
+function rawSize(keys: Record<string, string>, bpp: 3 | 4, maxImageBytes: number): number {
+  const width = uintKey(keys, 's')
+  const height = uintKey(keys, 'v')
+  checkSize(width, height, maxImageBytes)
+  return width * height * bpp
 }
 
 /** zlib inflate (RFC 1950), falling back to raw deflate; output bounded by `limit`. */
 function inflate(data: Uint8Array, limit: number): Uint8Array {
   const attempt = (fn: typeof inflateSync): Uint8Array | KittyError => {
     try {
-      const out = fn(data, { maxOutputLength: limit })
+      // One output buffer of the expected size, not 16 KiB pieces joined after.
+      const out = fn(data, { maxOutputLength: limit, chunkSize: Math.max(64, Math.min(limit, 1 << 20)) })
       return new Uint8Array(out.buffer, out.byteOffset, out.length)
     } catch (error) {
       if (error instanceof RangeError || (error as { code?: unknown }).code === 'ERR_BUFFER_TOO_LARGE') {

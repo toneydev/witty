@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { MAX_BOX_PIXELS, MAX_BOX_SIDE, createPlaceEmitter, emitPlacement, placementGeometry, scaleToBox } from '../src/term/emit.ts'
+import { cropRgba } from '../src/image/crop.ts'
 import { decodeSixel } from './helpers/sixel-decoder.ts'
 import { make, pixel, rng, solid } from './helpers/images.ts'
 import type { CursorPolicy, EngineEvent, Rgba } from '../src/types.ts'
@@ -200,6 +201,30 @@ test('repeated puts of the same image reuse the encoded bytes', () => {
   const a = emit(small, cell, screen)
   assert.equal(emit(small, cell, { columns: 200, rows: 60 }), a)
   assert.equal(emit(small, cell), a)
+})
+
+test('a source rectangle draws that part of the image, and repeated cropped puts reuse the bytes', () => {
+  const cell = { width: 9.375, height: 20 }
+  const image = busy(64, 48, 8)
+  const source = { x: 10, y: 4, width: 20, height: 30 }
+  const cropped = { ...place(image, 5, 3, 'move'), source }
+  const emit = createPlaceEmitter()
+  const first = emit(cropped, cell)
+  // The same bytes as placing the cut-out rectangle itself.
+  const cut = cropRgba(image, source.x, source.y, source.width, source.height)
+  assert.deepEqual(first, createPlaceEmitter({ cacheBytes: 0 })(place(cut, 5, 3, 'move'), cell))
+  // A put with an equal rectangle (a new object, as each command makes) hits.
+  assert.equal(emit({ ...place(image, 5, 3, 'move'), source: { ...source } }, cell), first)
+  // Another rectangle, or none, misses.
+  assert.notEqual(emit({ ...place(image, 5, 3, 'move'), source: { ...source, x: 11 } }, cell), first)
+  assert.notEqual(emit(place(image, 5, 3, 'move'), cell), first)
+  // Clipped to the screen, the rectangle still keys the cache.
+  const clipped = emit({ ...place(image, 100, 3, 'move'), source }, cell, { columns: 80, rows: 24 })
+  assert.equal(emit({ ...place(image, 100, 3, 'move'), source: { ...source } }, cell, { columns: 80, rows: 24 }), clipped)
+  assert.deepEqual(
+    clipped,
+    createPlaceEmitter({ cacheBytes: 0 })(place(cut, 100, 3, 'move'), cell, { columns: 80, rows: 24 }),
+  )
 })
 
 test('the cache is bounded: least recently used first out, oversized outputs never kept', () => {

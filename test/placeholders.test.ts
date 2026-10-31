@@ -4,9 +4,9 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { cropRgba } from '../src/image/crop.ts'
 import { ROW_COLUMN_DIACRITICS } from '../src/term/diacritics.ts'
-import { VirtualPlacements, createPlaceholderPass } from '../src/term/placeholders.ts'
+import { MAX_HOLD_BYTES, VirtualPlacements, createPlaceholderPass } from '../src/term/placeholders.ts'
 import type { CellSize, Rgba, VirtualPlacement } from '../src/types.ts'
-import { make, pixel } from './helpers/images.ts'
+import { make, pixel, rng, solid } from './helpers/images.ts'
 import { decodeSixel } from './helpers/sixel-decoder.ts'
 
 const enc = new TextEncoder()
@@ -390,6 +390,153 @@ describe('placeholder pass', () => {
     const t = setup()
     const chunk = enc.encode('hello \x1b[1mworld\x1b[0m \u{E9}\u{1F600}\n')
     assert.equal(t.pass.push(chunk), chunk)
+  })
+
+  it('a strip exactly as long as the cells it replaces is still written, by push and by flush', () => {
+    // The pass once returned its input whenever its output had the input's
+    // length, dropping such a strip. Build the case: measure the strip of an
+    // n-cell row, then spell the n cells in exactly that many bytes (after the
+    // first cell every diacritic is optional, so a cell takes 4 to 10 bytes).
+    const sgr = '\x1b[38;5;42m'
+    /** Row 0's n cells in `length` bytes, the last with `lastMarks` diacritics; undefined when impossible. */
+    const spell = (n: number, length: number, lastMarks: 2 | 3): string | undefined => {
+      const last = lastMarks === 3 ? cell(0, n - 1, 0) : cell(0, n - 1)
+      let extra = length - enc.encode(cell(0, 0) + last).length - 4 * (n - 2)
+      if (extra < 0 || extra % 2 !== 0 || extra > 6 * (n - 2)) return undefined
+      let cells = cell(0, 0)
+      for (let c = 1; c < n - 1; c++) {
+        const add = Math.min(6, extra)
+        extra -= add
+        // Bare: continues the left cell; then row, row and column, all three (high byte 0).
+        cells += add === 0 ? PH : add === 2 ? cell(0) : add === 4 ? cell(0, c) : cell(0, c, 0)
+      }
+      return cells + last
+    }
+    const covered = new Set<number>()
+    for (let n = 3; n <= 40; n++) {
+      const image = solid(n * CELL.width, CELL.height, 200, 40, 40)
+      const strip = setup(placement(42, image, n, 1)).run(`${sgr}${row(0, n)}\r`).slice(sgr.length, -1)
+      assert.equal(strips(strip).length, 1)
+      for (const lastMarks of [2, 3] as const) {
+        const cells = spell(n, strip.length, lastMarks)
+        if (cells === undefined) continue
+        assert.equal(enc.encode(cells).length, strip.length)
+        const t = setup(placement(42, image, n, 1))
+        assert.equal(latin1(t.pass.push(enc.encode(sgr))), sgr)
+        const pushed = latin1(t.pass.push(enc.encode(cells)))
+        const flushed = latin1(t.pass.flush())
+        // Three diacritics end the last cell, so push writes the run; with two it is held for flush.
+        assert.deepEqual([pushed, flushed], lastMarks === 3 ? [strip, ''] : ['', strip], `${n} cells, ${lastMarks} diacritics last`)
+        covered.add(lastMarks)
+      }
+    }
+    assert.deepEqual([...covered].sort(), [2, 3], 'a same-length case was found for push and for flush')
+  })
+
+  it('SGR forms name the image and placement as before, malformed and capped ones included', () => {
+    // Each case follows fg 99 and underline 7. With no placements, the log names what the cell resolved to.
+    const cases: [string, string | undefined][] = [
+      ['\x1b[m', undefined],
+      ['\x1b[0m', undefined],
+      ['\x1b[;m', undefined],
+      ['\x1b[31m', 'image 1 placement 7'],
+      ['\x1b[97m', 'image 15 placement 7'],
+      ['\x1b[39m', undefined],
+      ['\x1b[59m', 'image 99'],
+      ['\x1b[38;5;5m', 'image 5 placement 7'],
+      ['\x1b[38;5;0005m', 'image 5 placement 7'],
+      ['\x1b[38;5;256m', 'image 99 placement 7'],
+      ['\x1b[38;5;5?m', 'image 99 placement 7'],
+      ['\x1b[38;5;m', undefined],
+      ['\x1b[38;5m', 'image 99 placement 7'],
+      ['\x1b[38;2;1;2;3m', 'image 66051 placement 7'],
+      ['\x1b[38;2;1;2m', 'image 99 placement 7'],
+      ['\x1b[38;2;1;2;300m', 'image 99 placement 7'],
+      ['\x1b[38;2;;2;3m', 'image 515 placement 7'],
+      ['\x1b[38;3;1;2;3m', 'image 99 placement 7'],
+      ['\x1b[48;2;1;2;3m', 'image 99 placement 7'],
+      ['\x1b[48;5;9;31m', 'image 1 placement 7'],
+      ['\x1b[1;38;2;0;0;5;4m', 'image 5 placement 7'],
+      ['\x1b[;38;5;7;m', undefined],
+      ['\x1b[38:2::0:0:5m', 'image 5 placement 7'],
+      ['\x1b[38:2:0:0:5m', 'image 5 placement 7'],
+      ['\x1b[38:2:9:0:0:5m', 'image 5 placement 7'],
+      ['\x1b[38:5:12m', 'image 12 placement 7'],
+      ['\x1b[38:5:x12m', 'image 99 placement 7'],
+      ['\x1b[:38:5:12m', 'image 99 placement 7'],
+      ['\x1b[48:5:12m', 'image 99 placement 7'],
+      ['\x1b[58:5:3m', 'image 99 placement 3'],
+      ['\x1b[58:2::0:1:0m', 'image 99 placement 256'],
+      ['\x1b[58;2;0;1;0m', 'image 99 placement 256'],
+      ['\x1b[4:3;38;5;6m', 'image 6 placement 7'],
+      ['\x1b[38;5;5:1m', 'image 99 placement 7'],
+      ['\x1b[38;5;5;0m', undefined],
+      ['\x1b[>4;2m', 'image 99 placement 7'],
+      ['\x1b[?38;5;5m', 'image 99 placement 7'],
+      ['\x1b[38;5;5 m', 'image 99 placement 7'],
+      ['\x1b[38;5\n;5m', 'image 5 placement 7'],
+      ['\x1b[38;5;5\x1b[m', undefined],
+      ['\x1b[38;5;5\x18m', 'image 99 placement 7'],
+      // Parameters past 256 bytes are dropped: the 0s still reset, `38;5;6` survives only inside the cap.
+      ['\x1b[' + '0;'.repeat(140) + '38;5;6m', undefined],
+      ['\x1b[' + '0;'.repeat(126) + '38;5;6m', undefined],
+      ['\x1b[' + '0;'.repeat(125) + '38;5;6m', 'image 6'],
+      ['\x1b[' + '0;'.repeat(124) + '38;5;6m', 'image 6'],
+      ['\x1b[38;2;0;0;5m\x1b[22m', 'image 5 placement 7'],
+      ['\x1b[38;5;123456789012345678901234m', 'image 99 placement 7'],
+    ]
+    for (const [sgr, expected] of cases) {
+      const t = setup()
+      t.run(`\x1b[38;5;99;58;5;7m${sgr}${cell(0, 0)}\r`)
+      const named = t.logs.map((l) => /image \d+(?: placement \d+)?/.exec(l)?.[0]).filter((s) => s !== undefined)
+      assert.deepEqual(named, expected === undefined ? [] : [expected], JSON.stringify(sgr))
+    }
+  })
+
+  it('random streams come out the same however they are chunked (fixed seed)', () => {
+    const random = rng(2026)
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)]!
+    const pieces = [
+      '\x1b[38;5;42m', '\x1b[38;2;0;0;42m', '\x1b[38:2::0:0:42m', '\x1b[58;5;3m', '\x1b[0m', '\x1b[39m', '\x1b[1;38;5;42;4m',
+      '\x1b[>4;2m', '\x1b[?0m', '\x1b[38;5;42 q', '\x1b[38;5\n;42m', `\x1b[${'1;'.repeat(140)}38;5;42m`, '\x1b[2;3H',
+      '\x1b]0;t\x07', '\x1b]8;;u\x1b\\', '\x1b7', '\x1b\x18', 'x', ' ', '│', '\r\n', '\u{10EEEF}',
+    ]
+    const placements = (): VirtualPlacement[] => [placement(42, cellImage(3, 3), 3, 3), placement(42, cellImage(3, 3, 5), 3, 3, 3)]
+    for (let trial = 0; trial < 120; trial++) {
+      let text = ''
+      for (let k = 0; k < 120; k++) {
+        // Cells with fewer than three diacritics: a run is then held, never cut, at a chunk end.
+        const marks = Array.from({ length: Math.floor(random() * 3) }, () => Math.floor(random() * 3))
+        text += random() < 0.5 ? cell(...marks) : pick(pieces)
+      }
+      const input = enc.encode(text)
+      const chunks: Uint8Array[] = []
+      for (let at = 0; at < input.length; ) {
+        const size = Math.floor(random() * 12)
+        chunks.push(input.subarray(at, at + size))
+        at += size
+      }
+      assert.equal(setup(...placements()).run(...chunks), setup(...placements()).run(input), `trial ${trial}`)
+    }
+  })
+
+  it('a held run is bounded: a long run in small chunks is written once it outgrows MAX_HOLD_BYTES', () => {
+    assert.ok(MAX_HOLD_BYTES >= 400 * 10, 'a 400-column row of cells with three diacritics fits')
+    // No placement: the cells pass through unchanged, so the bytes written count the bytes pushed.
+    const t = setup()
+    const chunk = enc.encode(cell(0, 0).repeat(4))
+    const written: Uint8Array[] = [t.pass.push(enc.encode('\x1b[38;5;5m'))]
+    let pushed = written[0]!.length
+    let total = pushed
+    for (let k = 0; k < (2 * MAX_HOLD_BYTES) / chunk.length; k++) {
+      const out = t.pass.push(chunk)
+      written.push(out)
+      pushed += chunk.length
+      total += out.length
+      assert.ok(pushed - total <= MAX_HOLD_BYTES + chunk.length, `${pushed - total} bytes held`)
+    }
+    written.push(t.pass.flush())
+    assert.equal(latin1(concat(written)), latin1(enc.encode('\x1b[38;5;5m' + cell(0, 0).repeat(4 * ((2 * MAX_HOLD_BYTES) / chunk.length)))))
   })
 })
 

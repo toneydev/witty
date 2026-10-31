@@ -96,7 +96,9 @@ function percent(v: number): number {
 export function encodeSixelBytes(image: Rgba, opts: SixelOptions = {}): Uint8Array {
   const width = image.width
   const height = image.height
-  const maxColors = Math.max(1, Math.min(256, Math.floor(opts.maxColors ?? 256)))
+  // Not finite (NaN) counts as absent: NaN would pass every clamp unchanged.
+  const requested = opts.maxColors !== undefined && Number.isFinite(opts.maxColors) ? opts.maxColors : 256
+  const maxColors = Math.max(1, Math.min(256, Math.floor(requested)))
   const transparent = opts.transparent ?? true
   const { palette, indices } = quantize(image, maxColors, { alphaThreshold: transparent ? 128 : 0 })
   const n = palette.length / 3

@@ -9,6 +9,7 @@ const G = 0x47
 const BACKSLASH = 0x5c
 const HEADER = Uint8Array.of(ESC, UNDERSCORE, G)
 const LONE_ESC = Uint8Array.of(ESC)
+const EMPTY = new Uint8Array(0)
 const latin1 = new TextDecoder('latin1')
 
 /** Largest kitty APC body held before it is given up and passed through as text. */
@@ -39,7 +40,10 @@ function concat(parts: readonly Uint8Array[]): Uint8Array {
  * from the `push` that delivered them. Text items may alias the pushed chunk.
  *
  * An APC aborted by an `ESC` not followed by `\`, or one that grows past
- * `maxApcBytes`, is passed through as text unchanged.
+ * `maxApcBytes`, is passed through as text unchanged. Within one chunk the
+ * text before an APC is cut off only once the APC completes, so an aborted
+ * one is simply more of the same text run: nothing is copied, however many
+ * there are.
  */
 export class KittySplitter implements ApcSplitter {
   readonly #maxApcBytes: number
@@ -65,11 +69,15 @@ export class KittySplitter implements ApcSplitter {
     }
     let pos = 0
     let textStart = 0
+    /** Where the APC in progress starts in `buf` (its ESC), or -1 when it began in an earlier chunk. */
+    let apcStart = -1
+    /** Where the part of its body that lies in `buf` starts. */
+    let bodyStart = 0
 
     if (this.#inApc && this.#bodyEsc && buf.length > 0) {
       this.#bodyEsc = false
       if (buf[0] === BACKSLASH) {
-        this.#finishApc(out)
+        this.#finishApc(out, EMPTY)
         pos = textStart = 1
       } else {
         // The held ESC aborts the APC; it is rescanned as the start of a new sequence.
@@ -96,42 +104,43 @@ export class KittySplitter implements ApcSplitter {
           pos = esc + 2
           continue
         }
-        this.#text(out, buf.subarray(textStart, esc))
+        // A kitty APC. The text before it is written when it completes (or at
+        // the end of the chunk); if it is aborted, its bytes stay in that text.
         this.#inApc = true
-        this.#body = []
-        this.#bodyLength = 0
-        pos = textStart = esc + 3
+        apcStart = esc
+        pos = bodyStart = esc + 3
       } else {
         const esc = buf.indexOf(ESC, pos)
         const end = esc < 0 ? length : esc
-        if (end > pos) {
-          this.#body.push(buf.slice(pos, end))
-          this.#bodyLength += end - pos
-        }
-        if (this.#bodyLength > this.#maxApcBytes) {
-          this.#abandonApc(out)
-          pos = textStart = end
+        if (this.#bodyLength + (end - bodyStart) > this.#maxApcBytes) {
+          this.#abandon(out, apcStart)
+          pos = end
           continue
         }
-        if (esc < 0) {
-          pos = textStart = length
-          break
-        }
-        if (esc + 1 >= length) {
-          this.#bodyEsc = true
-          pos = textStart = length
-          break
+        if (esc < 0 || esc + 1 >= length) {
+          // The chunk ends inside the APC (perhaps on the ESC of its ST): keep its body.
+          if (apcStart >= 0) this.#text(out, buf.subarray(textStart, apcStart))
+          this.#keepBody(buf.slice(bodyStart, end))
+          this.#bodyEsc = esc >= 0
+          return out
         }
         if (buf[esc + 1] === BACKSLASH) {
-          this.#finishApc(out)
+          if (apcStart >= 0) this.#text(out, buf.subarray(textStart, apcStart))
+          this.#finishApc(out, buf.subarray(bodyStart, esc))
           pos = textStart = esc + 2
         } else {
-          this.#abandonApc(out)
-          pos = textStart = esc
+          this.#abandon(out, apcStart)
+          pos = esc
         }
       }
     }
-    if (!this.#inApc) this.#text(out, buf.subarray(textStart))
+    if (this.#inApc) {
+      // The chunk ended right after `ESC _ G` (or was empty, mid-APC).
+      if (apcStart >= 0) this.#text(out, buf.subarray(textStart, apcStart))
+      this.#keepBody(buf.slice(bodyStart))
+      return out
+    }
+    this.#text(out, buf.subarray(textStart))
     return out
   }
 
@@ -157,10 +166,30 @@ export class KittySplitter implements ApcSplitter {
     else out.push({ kind: 'text', data })
   }
 
-  #finishApc(out: SplitItem[]): void {
-    const body = latin1.decode(concat(this.#body))
+  /** Completes the APC: its kept body plus `tail`, the rest of the body in this chunk. */
+  #finishApc(out: SplitItem[], tail: Uint8Array): void {
+    const body = latin1.decode(this.#body.length === 0 ? tail : concat([...this.#body, tail]))
     this.#resetApc()
     out.push({ kind: 'apc', command: parseKittyCommand(body) })
+  }
+
+  /** Keeps a copy of part of the APC body for the next chunk (the caller may reuse its buffer). */
+  #keepBody(part: Uint8Array): void {
+    if (part.length === 0) return
+    this.#body.push(part)
+    this.#bodyLength += part.length
+  }
+
+  /**
+   * Gives up on the APC in progress inside `push`. One that began at
+   * `apcStart` of this chunk is still in it, between `textStart` and the scan
+   * position, so its bytes simply stay in the text run. One carried over from
+   * earlier chunks (`apcStart` -1, the text run then starts at 0) is written
+   * from its kept bytes.
+   */
+  #abandon(out: SplitItem[], apcStart: number): void {
+    if (apcStart >= 0) this.#resetApc()
+    else this.#abandonApc(out)
   }
 
   /** Gives up on the held APC: its bytes so far (`ESC _ G` + body) become text. */

@@ -10,7 +10,7 @@
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { after, describe, it } from 'node:test'
@@ -22,6 +22,8 @@ const root = fileURLToPath(new URL('..', import.meta.url))
 const cli = path.join(root, 'src', 'cli.ts')
 const stubWire = path.join(root, 'test', 'fixtures', 'stub-wire.ts')
 const fakeChild = path.join(root, 'test', 'fixtures', 'fake-child.ts')
+const exitChild = path.join(root, 'test', 'fixtures', 'exit-child.ts')
+const hooksWire = path.join(root, 'test', 'fixtures', 'hooks-wire.ts')
 const tmp = mkdtempSync(path.join(os.tmpdir(), 'witty-e2e-'))
 
 const outers: Outer[] = []
@@ -33,8 +35,13 @@ after(() => {
 let runs = 0
 /** Starts witty hosting the fake child (exit code 42) inside an outer pty. */
 function startWitty(options: OuterOptions = {}, extra: string[] = []) {
+  return startWittyWith(['--wire', stubWire, ...extra, '--', process.execPath, fakeChild, '42'], options)
+}
+
+/** Starts witty (logging, cell 8x16) with these further arguments inside an outer pty. */
+function startWittyWith(rest: string[], options: OuterOptions = {}) {
   const log = path.join(tmp, `witty-${++runs}.log`)
-  const args = [cli, '--cell', '8x16', '--log', log, '--wire', stubWire, ...extra, '--', process.execPath, fakeChild, '42']
+  const args = [cli, '--cell', '8x16', '--log', log, ...rest]
   const outer = startOuter(process.execPath, args, { cwd: root, ...options })
   outers.push(outer)
   const readLog = () => {
@@ -187,6 +194,88 @@ describe('witty end to end', { concurrency: true }, () => {
     outer.write('QUIT')
     assert.equal(await withTimeout(outer.exited, 15000, 'witty exit'), 42)
     assert.match(readLog(), /cell size 9\.373x20\.000 \(text area\)/)
+  })
+
+  it('keeps the child exit code when input arrives after the child has exited', async () => {
+    // The hooks wire holds the child's last kitty command for 2 s, and with it
+    // node-pty's 'exit' (witty stops reading output meanwhile). The child is
+    // long gone by then, so the keys typed meanwhile, and the command's OK
+    // response, land on a closed input pipe: that used to crash witty with
+    // `write EAGAIN` and exit 1.
+    const { outer, readLog } = startWittyWith(['--wire', hooksWire, '--', process.execPath, exitChild, '42', 'slow=2000'], {
+      cellSize: { width: 8, height: 16 },
+    })
+    await outer.waitFor('READY', 30000)
+    outer.write('QUIT')
+    let done = false
+    void outer.exited.then(() => (done = true))
+    for (let i = 0; i < 36 && !done; i++) {
+      await new Promise((r) => setTimeout(r, 50))
+      outer.write('x')
+    }
+    assert.equal(await withTimeout(outer.exited, 15000, 'witty exit'), 42)
+    assert.ok(outer.output().includes('BYE'), 'the output after the held command was lost')
+    const log = readLog()
+    assert.doesNotMatch(log, /fatal/)
+    assert.match(log, /child exited with 42/)
+  })
+
+  it('says why when the program cannot be started', async () => {
+    const bad = path.join(tmp, 'not a program.exe')
+    writeFileSync(bad, 'not a program')
+    const { outer, readLog } = startWittyWith(['--wire', stubWire, '--', bad], { cellSize: { width: 8, height: 16 } })
+    // CreateProcess's error (216, ERROR_EXE_MACHINE_TYPE_MISMATCH, for text in a .exe) is the exit code.
+    const code = await withTimeout(outer.exited, 30000, 'witty exit')
+    assert.notEqual(code, 0)
+    assert.ok(outer.output().includes(`witty: could not start ${bad} (error ${code})`), JSON.stringify(outer.output()))
+    assert.match(readLog(), /could not start/)
+  })
+
+  it('takes answers to its own queries that miss the window out of the input, and forwards later ones', async () => {
+    // A slow terminal: nothing within the window, then all three answers at once.
+    const { outer, readLog } = startWitty({ cols: 158, rows: 38 })
+    await outer.waitFor('READY', 30000)
+    outer.write('\x1b[4;760;1481t\x1b[8;38;158t\x1b[6;20;9tlate')
+    await waitForInput(outer, 'late')
+    // A second answer is someone else's (the child asked): it passes.
+    outer.write('\x1b[6;20;9tnext')
+    await waitForInput(outer, 'next')
+    outer.write('QUIT')
+    assert.equal(await withTimeout(outer.exited, 15000, 'witty exit'), 42)
+    assert.ok(!childInput(outer).includes(hex('\x1b[4;760;1481t')), 'a late answer reached the child')
+    assert.ok(!childInput(outer).includes(hex('\x1b[8;38;158t')), 'a late answer reached the child')
+    assert.equal(childInput(outer).split(hex('\x1b[6;20;9t')).length - 1, 1, 'exactly the second CSI 6 t reaches the child')
+    const log = readLog()
+    assert.match(log, /cell size 8\.000x16\.000 \(fallback\)/)
+    assert.match(log, /reply cell 9x20 px \(CSI 16 t\) \(late answer to witty, consumed\)/)
+    assert.match(log, /cell size 9\.373x20\.000 \(text area, seen on input\)/)
+  })
+
+  it('on Ctrl+Break kills the child and leaves the normal way, with its exit code', async () => {
+    const { outer, readLog } = startWitty({ cellSize: { width: 8, height: 16 } })
+    await outer.waitFor('READY', 30000)
+    // Ctrl+Break as Windows Terminal sends it (win32-input-mode): VK_CANCEL, key down, left Ctrl.
+    // It raises CTRL_BREAK_EVENT whatever the input mode; Node's default ended witty on the spot.
+    outer.write('\x1b[3;70;0;1;8;1_')
+    const code = await withTimeout(outer.exited, 15000, 'witty exit')
+    const log = readLog()
+    assert.match(log, /SIGBREAK, killing the child/)
+    const child = /child exited with (-?\d+)/.exec(log)
+    if (child !== null) assert.equal(code, Number(child[1]))
+    else assert.equal(code, 128 + 21, 'neither the child exit nor the SIGBREAK fallback')
+  })
+
+  it('resets the terminal modes and reports the error when witty itself crashes', async () => {
+    const { outer, readLog } = startWittyWith(['--wire', hooksWire, '--', process.execPath, exitChild, '0', 'crash=1', 'stay'], {
+      cellSize: { width: 8, height: 16 },
+    })
+    await outer.waitFor('READY', 30000)
+    outer.write('QUIT')
+    assert.equal(await withTimeout(outer.exited, 15000, 'witty exit'), 1)
+    const out = outer.output()
+    assert.ok(out.includes('\x1b7\x1b[?1049l\x1b[?25h'), `no terminal reset in ${JSON.stringify(out.slice(-300))}`)
+    assert.ok(out.includes('witty: boom from the hooks wire'), JSON.stringify(out.slice(-300)))
+    assert.match(readLog(), /fatal: Error: boom from the hooks wire/)
   })
 
   it('exits 127 when the command does not exist', async () => {

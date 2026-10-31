@@ -4,7 +4,8 @@
 // lets the test type and resize.
 
 import * as nodePty from 'node-pty'
-import { releaseNodePty, settleExitCode } from '../../src/host/pty.ts'
+import { releaseNodePty, settleExitCode, watchInput } from '../../src/host/pty.ts'
+import { quoteWindowsArgument } from '../../src/host/resolve.ts'
 
 export type OuterOptions = {
   cwd?: string
@@ -43,7 +44,9 @@ const ANSWERS: Array<[RegExp, (o: OuterOptions) => string | undefined]> = [
 ]
 
 export function startOuter(file: string, args: string[], options: OuterOptions = {}): Outer {
-  const pty = nodePty.spawn(file, args, {
+  // Quoted here, as witty does: node-pty's own quoting splits `"a b"` and drops a lone space.
+  // No arguments must be [] rather than '', which node-pty would take as the command line, file unquoted.
+  const pty = nodePty.spawn(file, args.length === 0 ? [] : args.map(quoteWindowsArgument).join(' '), {
     name: 'xterm-256color',
     cols: options.cols ?? 80,
     rows: options.rows ?? 24,
@@ -54,6 +57,15 @@ export function startOuter(file: string, args: string[], options: OuterOptions =
   let out = ''
   let scanned = 0
   let done = false
+  // Typing at a program that has just exited fails asynchronously on node-pty's
+  // input pipe (EAGAIN); without a listener that would crash the test run.
+  let inputClosed = false
+  watchInput(pty, () => {
+    inputClosed = true
+  })
+  const send = (data: string): void => {
+    if (!done && !inputClosed) pty.write(data)
+  }
   const waiters = new Set<() => void>()
   pty.onData((data) => {
     out += data
@@ -65,7 +77,7 @@ export function startOuter(file: string, args: string[], options: OuterOptions =
       for (let m = re.exec(region); m !== null; m = re.exec(region)) {
         if (start + m.index + m[0].length <= scanned) continue
         const reply = answer(options)
-        if (reply !== undefined) pty.write(reply)
+        if (reply !== undefined) send(reply)
       }
     }
     scanned = out.length
@@ -111,8 +123,15 @@ export function startOuter(file: string, args: string[], options: OuterOptions =
         waiters.add(check)
       })
     },
-    write: (data) => pty.write(data),
-    resize: (cols, rows) => pty.resize(cols, rows),
+    write: send,
+    resize: (cols, rows) => {
+      if (done) return
+      try {
+        pty.resize(cols, rows)
+      } catch {
+        // The program exited between the check and the call.
+      }
+    },
     exited,
     dispose() {
       if (!done) {

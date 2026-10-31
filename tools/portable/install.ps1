@@ -30,12 +30,39 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
 }
 function Test-SamePath([string]$a, [string]$b) { $a.TrimEnd('\') -ieq $b.TrimEnd('\') }
 
+# A running witty holds files in the install (conpty.node is loaded,
+# OpenConsole.exe runs), so deleting it in place stops at the first of them,
+# after dist\ is already gone: every new witty then fails until all sessions
+# are closed and the install is run again. Windows does rename a folder whose
+# files are in use, so the old install is moved aside first, and deleted as
+# far as it can be; what a running witty still holds is retried on the next
+# install or uninstall.
+$asidePattern = "$(Split-Path -Leaf $target).old-*"
+function Remove-Aside {
+  Get-ChildItem -Directory -Path (Split-Path -Parent $target) -Filter $asidePattern -ErrorAction SilentlyContinue |
+    ForEach-Object { Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue }
+}
+function Move-Aside {
+  if (-not (Test-Path $target)) { return }
+  $aside = "$(Split-Path -Leaf $target).old-$(Get-Date -Format 'yyyyMMddHHmmss')-$PID"
+  try {
+    Rename-Item -Path $target -NewName $aside
+  } catch {
+    throw "Could not move the old install at $target aside (is a shell's current directory inside it?): $($_.Exception.Message)"
+  }
+  Remove-Aside
+}
+
+Remove-Aside
 if ($Uninstall) {
-  if (Test-Path $target) { Remove-Item -Recurse -Force $target }
+  Move-Aside
   $entries = Get-UserPath
   $kept = @($entries | Where-Object { -not (Test-SamePath $_ $target) })
   if ($kept.Count -ne $entries.Count) { Set-UserPath $kept }
   Write-Host "witty removed from $target and from the user PATH."
+  if (Get-ChildItem -Directory -Path (Split-Path -Parent $target) -Filter $asidePattern -ErrorAction SilentlyContinue) {
+    Write-Host 'Files a running witty still uses are left beside it; the next install or uninstall removes them.'
+  }
   exit 0
 }
 
@@ -54,7 +81,7 @@ if (-not (Test-Path (Join-Path $source 'dist\cli.js'))) {
 }
 if (Test-SamePath $target $source) { throw "The release is already extracted at $target; nothing to copy." }
 
-if (Test-Path $target) { Remove-Item -Recurse -Force $target }
+Move-Aside
 New-Item -ItemType Directory -Force $target | Out-Null
 Copy-Item -Recurse -Force (Join-Path $source '*') $target
 

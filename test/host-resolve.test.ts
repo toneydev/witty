@@ -6,18 +6,21 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import os from 'node:os'
 import path from 'node:path'
 import { after, describe, it } from 'node:test'
-import { escapeBatchArgument, findExecutable, getEnv, resolveCommand } from '../src/host/resolve.ts'
+import { escapeBatchArgument, findExecutable, getEnv, isLaunchable, quoteWindowsArgument, resolveCommand } from '../src/host/resolve.ts'
 
 const dir = mkdtempSync(path.join(os.tmpdir(), 'witty resolve '))
 const bin1 = path.join(dir, 'bin1')
 const bin2 = path.join(dir, 'bin 2')
 mkdirSync(bin1)
 mkdirSync(bin2)
-writeFileSync(path.join(bin1, 'tool'), '') // bare file, found only after PATHEXT candidates
+writeFileSync(path.join(bin1, 'tool'), '') // an extensionless shim (npm writes one next to each .cmd): never a hit
 writeFileSync(path.join(bin2, 'tool.cmd'), '@echo off\r\n')
 writeFileSync(path.join(bin2, 'other.exe'), '')
 writeFileSync(path.join(bin1, 'other.exe'), '')
 writeFileSync(path.join(bin2, 'script.ps1'), '')
+writeFileSync(path.join(bin1, 'jsonly.js'), '') // PATHEXT lists .JS, but CreateProcess cannot run it
+writeFileSync(path.join(bin2, 'jsonly.exe'), '')
+writeFileSync(path.join(bin2, 'python3.12.exe'), '')
 after(() => rmSync(dir, { recursive: true, force: true }))
 
 const env = { Path: `${bin1};"${bin2}"`, PATHEXT: '.COM;.EXE;.BAT;.CMD', ComSpec: 'C:\\Windows\\system32\\cmd.exe' }
@@ -81,11 +84,24 @@ describe('resolve', () => {
     assert.equal(getEnv({}, 'PATH'), undefined)
   })
 
-  it('searches PATH in order, extensions before the bare name in each directory', () => {
+  it('searches PATH in order, taking only files witty can start', () => {
     assert.equal(findExecutable('other', { env }), path.join(bin1, 'other.exe'))
-    // bin1 has only a bare `tool`; it still wins over bin2's tool.cmd, since directories come first.
-    assert.equal(findExecutable('tool', { env }), path.join(bin1, 'tool'))
+    // bin1 has only an extensionless `tool`, which CreateProcess cannot run: bin2's tool.cmd is found.
+    assert.equal(findExecutable('tool', { env }), path.join(bin2, 'tool.cmd'))
     assert.equal(findExecutable('tool', { env: { ...env, Path: `"${bin2}";${bin1}` } }), path.join(bin2, 'tool.cmd'))
+    // PATHEXT's .JS (or .VBS, .MSC ...) in an earlier directory does not shadow a program further on.
+    const withJs = { ...env, PATHEXT: '.JS;.COM;.EXE;.VBS;.BAT;.CMD' }
+    assert.equal(findExecutable('jsonly', { env: withJs }), path.join(bin2, 'jsonly.exe'))
+  })
+
+  it('appends extensions to dotted names, as cmd and PowerShell do', () => {
+    assert.equal(findExecutable('python3.12', { env }), path.join(bin2, 'python3.12.exe'))
+    assert.equal(findExecutable('python3.12.exe', { env }), path.join(bin2, 'python3.12.exe'))
+  })
+
+  it('knows which files it can start', () => {
+    for (const yes of ['a.exe', 'A.EXE', 'b.com', 'c.cmd', 'd.Bat', 'C:\\x y\\claude.exe']) assert.equal(isLaunchable(yes), true, yes)
+    for (const no of ['a', 'a.js', 'a.ps1', 'a.exe.txt', 'python3.12', 'a.vbs', 'a.msc']) assert.equal(isLaunchable(no), false, no)
   })
 
   it('skips relative PATH entries, which would search the current directory', () => {
@@ -99,15 +115,23 @@ describe('resolve', () => {
     assert.ok(checked.every((file) => path.win32.isAbsolute(file)), checked.join(' | '))
   })
 
-  it('takes a name with an extension as is', () => {
-    assert.equal(findExecutable('script.ps1', { env }), path.join(bin2, 'script.ps1'))
+  it('takes a launchable name as is, and says so when a name is there but is no program', () => {
     assert.equal(findExecutable('tool.exe', { env }), undefined)
+    assert.equal(findExecutable('script.ps1', { env }), undefined)
+    assert.throws(
+      () => resolveCommand('script.ps1', [], { env }),
+      (e: Error) => e.message === `witty: cannot start ${path.join(bin2, 'script.ps1')}: only .exe, .com, .cmd and .bat files can be run`,
+    )
+    assert.throws(() => resolveCommand(path.join(bin1, 'tool'), [], { env }), /witty: cannot start .*bin1\\tool: only \.exe/)
+    assert.throws(() => resolveCommand('nothing.ps1', [], { env }), /witty: command not found: nothing\.ps1/)
   })
 
-  it('resolves absolute and relative paths against cwd, trying PATHEXT when extensionless', () => {
+  it('resolves absolute and relative paths against cwd, trying PATHEXT when the name has no launchable extension', () => {
     assert.equal(findExecutable(path.join(bin2, 'tool'), { env }), path.join(bin2, 'tool.cmd'))
+    assert.equal(findExecutable(path.join(bin1, 'tool'), { env }), undefined, 'the extensionless file itself is no program')
     assert.equal(findExecutable('.\\bin 2\\other', { env, cwd: dir }), path.join(bin2, 'other.exe'))
     assert.equal(findExecutable('bin1/other.exe', { env, cwd: dir }), path.join(bin1, 'other.exe'))
+    assert.equal(findExecutable('.\\bin 2\\python3.12', { env, cwd: dir }), path.join(bin2, 'python3.12.exe'))
     assert.equal(findExecutable('.\\nope', { env, cwd: dir }), undefined)
   })
 
@@ -122,9 +146,41 @@ describe('resolve', () => {
     assert.equal(findExecutable('claude')?.toLowerCase(), expected.toLowerCase())
   })
 
-  it('starts executables directly with an argv array', () => {
+  it('starts programs directly, with the command line quoted per the MSVC rules', () => {
     const r = resolveCommand('other', ['a b', 'c'], { env })
-    assert.deepEqual(r, { file: path.join(bin1, 'other.exe'), args: ['a b', 'c'], resolved: path.join(bin1, 'other.exe') })
+    assert.deepEqual(r, { file: path.join(bin1, 'other.exe'), args: '"a b" c', resolved: path.join(bin1, 'other.exe') })
+    // Not '': node-pty would take that as the whole command line and leave the path unquoted.
+    assert.deepEqual(resolveCommand('other', [], { env }).args, [])
+    assert.throws(() => resolveCommand('other', ['a\0b'], { env }), /cannot pass an argument with a NUL/)
+  })
+
+  it('quotes program arguments so CommandLineToArgvW gives them back', () => {
+    assert.equal(quoteWindowsArgument('plain'), 'plain')
+    assert.equal(quoteWindowsArgument('C:\\dir\\'), 'C:\\dir\\', 'no quotes, so trailing backslashes stay single')
+    assert.equal(quoteWindowsArgument(''), '""')
+    assert.equal(quoteWindowsArgument(' '), '" "')
+    assert.equal(quoteWindowsArgument('\t'), '"\t"')
+    assert.equal(quoteWindowsArgument('"a b"'), '"\\"a b\\""')
+    assert.equal(quoteWindowsArgument('a"b'), '"a\\"b"')
+    assert.equal(quoteWindowsArgument('a\\"b'), '"a\\\\\\"b"')
+    assert.equal(quoteWindowsArgument('C:\\Program Files\\x\\'), '"C:\\Program Files\\x\\\\"')
+    assert.equal(quoteWindowsArgument('a b\\\\'), '"a b\\\\\\\\"')
+    assert.equal(quoteWindowsArgument('a\\b c'), '"a\\b c"', 'backslashes not before a quote stay single')
+  })
+
+  it('passes every argument intact to a real program (node.exe)', () => {
+    // node-pty hands `<quoted file> <args>` to CreateProcess; spawnSync's verbatim mode does the same.
+    const script = 'process.stdout.write(JSON.stringify(process.argv.slice(1)))'
+    const args = [...NASTY, '"a b"', ' ', '\t', 'x\\', 'x\\\\', 'a b\\', '\\"', '\\\\"x', '"', '\\']
+    const r = resolveCommand(process.execPath, ['-e', script, ...args], { env: process.env })
+    const out = spawnSync(r.file, [r.args], {
+      argv0: `"${r.file}"`,
+      windowsVerbatimArguments: true,
+      windowsHide: true,
+      encoding: 'utf8',
+    })
+    assert.equal(out.stderr, '')
+    assert.deepEqual(JSON.parse(out.stdout), args)
   })
 
   it('runs batch files through cmd.exe with extensions on, delayed expansion off and escaped arguments', () => {

@@ -4,7 +4,6 @@ import type { EngineEvent, KittyCommand, KittyEngine, KittyEngineOptions, Rgba, 
 import { KittyError, encodeResponse, printable, uintKey } from './command.ts'
 import type { ResponseFields } from './command.ts'
 import { DEFAULT_MAX_IMAGE_BYTES, DEFAULT_MAX_PAYLOAD_BYTES, decodeImage } from './decode.ts'
-import { cropRgba as crop } from '../image/crop.ts'
 
 /** Default bound on stored image data (RGBA bytes) before LRU eviction. */
 export const DEFAULT_MAX_STORE_BYTES = 256 * 1024 * 1024
@@ -149,7 +148,7 @@ export class Engine implements KittyEngine {
         // kitty: any delete aborts a partial chunked upload.
         this.#loading = null
         events.push({ kind: 'log', message: 'chunked transmission aborted by a delete command' })
-      } else {
+      } else if (isTransmit(keys.a)) {
         this.#appendChunk(loading, payload)
         if (keys.q !== undefined) loading.keys.q = keys.q
         if (keys.m === '1') return events
@@ -158,9 +157,12 @@ export class Engine implements KittyEngine {
           this.#respondError(events, loading.keys, loading.error)
           return events
         }
-        await this.#execute(events, loading.keys, loading.payload.join(''))
+        // The chunks go to the decoder as they came: each may carry its own padding.
+        await this.#execute(events, loading.keys, loading.payload)
         return events
       }
+      // As in kitty, only a transmission continues the upload: a put (or any
+      // other action) between its chunks runs on its own and the upload goes on.
     } else if (keys.m === '1' && isTransmit(keys.a)) {
       const { m: _m, ...rest } = keys
       const started: Loading = { keys: rest, payload: [], length: 0, error: null }
@@ -185,7 +187,7 @@ export class Engine implements KittyEngine {
     loading.payload.push(payload)
   }
 
-  async #execute(events: EngineEvent[], keys: Record<string, string>, payload: string): Promise<void> {
+  async #execute(events: EngineEvent[], keys: Record<string, string>, payload: string | readonly string[]): Promise<void> {
     try {
       const action = keys.a === undefined || keys.a === '' ? 't' : keys.a
       switch (action) {
@@ -213,7 +215,12 @@ export class Engine implements KittyEngine {
     }
   }
 
-  async #transmit(events: EngineEvent[], action: 't' | 'T' | 'q', keys: Record<string, string>, payload: string): Promise<void> {
+  async #transmit(
+    events: EngineEvent[],
+    action: 't' | 'T' | 'q',
+    keys: Record<string, string>,
+    payload: string | readonly string[],
+  ): Promise<void> {
     const i = uintKey(keys, 'i')
     const number = uintKey(keys, 'I')
     const p = uintKey(keys, 'p')
@@ -321,9 +328,12 @@ export class Engine implements KittyEngine {
     else image.anonymousPlacements++
     this.#placed.add(image)
     this.#sync(image)
+    // The stored image and the rectangle, never a crop: the emitter cuts it
+    // only when it has no encoded bytes for them yet (it caches by image).
     events.push({
       kind: 'place',
-      image: source === undefined ? image.rgba : crop(image.rgba, source.x, source.y, source.width, source.height),
+      image: image.rgba,
+      ...(source === undefined ? {} : { source }),
       columns,
       rows,
       cursor: keys.C === '1' ? 'stay' : 'move',
@@ -591,12 +601,19 @@ export class Engine implements KittyEngine {
   }
 
   /**
-   * Evicts least recently used images (never `keep`) until the store fits its
-   * bounds. Constant time while it fits: nothing is walked or copied.
+   * Evicts images (never `keep`) until the store fits its bounds: as in kitty,
+   * those without placements first, then the least recently used. Constant
+   * time while it fits: nothing is walked or copied.
    */
   #evict(keep: number, events: EngineEvent[]): void {
     if (!this.#overBudget()) return
-    // Deleting the entry being visited is safe while iterating a Map.
+    // Deleting the entry being visited is safe while iterating a Set or a Map.
+    for (const image of this.#unreferenced) {
+      if (!this.#overBudget()) return
+      if (image.id === keep) continue
+      this.#remove(image)
+      events.push({ kind: 'log', message: `evicted image ${image.id} to bound image memory` })
+    }
     for (const image of this.#images.values()) {
       if (!this.#overBudget()) return
       if (image.id === keep) continue

@@ -32,6 +32,13 @@ export interface ChildPty {
   readonly pid: number
   /** Whether the bundled conpty.dll is in use (false after the fallback). */
   readonly bundledConpty: boolean
+  /**
+   * Whether the process was ever created. False when CreateProcess failed
+   * (node-pty then reports the Win32 error code as the exit code).
+   */
+  readonly started: boolean
+  /** Whether the input pipe has closed (the pseudo-console is gone); writes are dropped from then on. */
+  readonly inputClosed: boolean
   /** Writes input to the child (strings are sent as UTF-8). */
   write(data: string | Uint8Array): void
   resize(cols: number, rows: number): void
@@ -87,7 +94,9 @@ export const EXIT_CODE_SETTLE_MS = 2000
  * that is `undefined` (seen in CI as a flaky `undefined !== 42`), and a
  * caller taking it at face value would turn a failed child into exit 0.
  * The code arrives on the agent moments later, so this polls for it, for
- * at most {@link EXIT_CODE_SETTLE_MS}, and falls back to 0 only then.
+ * at most {@link EXIT_CODE_SETTLE_MS}, looks once more after that (a busy
+ * event loop can overrun the deadline while the code is already there), and
+ * only then gives up with 1: an exit code nobody reported is not a success.
  * Reaches into node-pty internals (1.2.0-beta), hence the optional chaining.
  */
 export async function settleExitCode(pty: nodePty.IPty, reported: number | undefined, settleMs = EXIT_CODE_SETTLE_MS): Promise<number> {
@@ -99,7 +108,37 @@ export async function settleExitCode(pty: nodePty.IPty, reported: number | undef
     if (typeof code === 'number') return code
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
-  return 0
+  const code = agent?.exitCode
+  return typeof code === 'number' ? code : 1
+}
+
+/** A stream node-pty writes the child's input to, as far as {@link watchInput} needs it. */
+type ErrorSource = { on?: (event: 'error', listener: (error: Error) => void) => unknown }
+
+/**
+ * Listens for errors on node-pty's input pipe (`_agent.inSocket`), calling
+ * `onClosed` on the first. Once the child has exited its pseudo-console goes
+ * away, and a write that lands before node-pty's 'exit' event (which waits
+ * for the output pipe to drain, tens of milliseconds later) fails
+ * asynchronously with EAGAIN (libuv's name for ERROR_NO_DATA). node-pty puts
+ * no 'error' listener on that socket, so without this one a keystroke typed
+ * as the child exits crashes the host. Returns false when the socket is not
+ * where this node-pty version keeps it.
+ */
+export function watchInput(pty: nodePty.IPty, onClosed: (error: Error) => void): boolean {
+  try {
+    const socket = (pty as unknown as { _agent?: { inSocket?: ErrorSource } })._agent?.inSocket
+    if (typeof socket?.on !== 'function') return false
+    let closed = false
+    socket.on('error', (error) => {
+      if (closed) return
+      closed = true
+      onClosed(error)
+    })
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -126,6 +165,10 @@ function wrap(pty: nodePty.IPty, bundled: boolean): ChildPty {
   const encoder = new TextEncoder()
   let exited = false
   let exitCode = 0
+  let inputClosed = false
+  watchInput(pty, () => {
+    inputClosed = true
+  })
   const exitListeners: Array<(code: number) => void> = []
   pty.onExit(({ exitCode: code }) => {
     if (exited) return
@@ -141,8 +184,15 @@ function wrap(pty: nodePty.IPty, bundled: boolean): ChildPty {
       return pty.pid
     },
     bundledConpty: bundled,
+    get started() {
+      // node-pty learns the pid once CreateProcess succeeded; after a failure it stays 0.
+      return pty.pid > 0
+    },
+    get inputClosed() {
+      return inputClosed
+    },
     write(data) {
-      if (exited) return
+      if (exited || inputClosed) return
       pty.write(typeof data === 'string' ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength))
     },
     resize(cols, rows) {
