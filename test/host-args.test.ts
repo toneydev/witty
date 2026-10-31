@@ -4,6 +4,9 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { parseArgs, UsageError } from '../src/host/args.ts'
 
+/** Matches a UsageError with exactly this message. */
+const usage = (message: string) => (e: unknown) => e instanceof UsageError && e.message === message
+
 describe('parseArgs', () => {
   it('defaults to claude with no args', () => {
     const o = parseArgs([])
@@ -62,6 +65,27 @@ describe('parseArgs', () => {
     assert.equal(parseArgs([]).files, true)
     assert.equal(parseArgs(['--no-files', 'claude']).files, false)
     assert.equal(parseArgs(['--', '--no-files']).files, true, 'after -- it belongs to the command')
+  })
+
+  it('refuses a value on a switch, so --no-files=false cannot quietly mean --no-files', () => {
+    assert.throws(() => parseArgs(['--no-files=false']), usage('--no-files takes no value, got "--no-files=false"'))
+    for (const sw of ['--debug=1', '--no-force=no', '--no-inherit-cursor=0', '--help=x', '--version=1']) {
+      assert.throws(() => parseArgs([sw]), UsageError, sw)
+    }
+    // After the command name it is the command's business.
+    assert.deepEqual(parseArgs(['claude', '--debug=1']).args, ['--debug=1'])
+  })
+
+  it('does not take the next option as a value; --opt=--x still can', () => {
+    assert.throws(
+      () => parseArgs(['--log', '--no-force', 'claude']),
+      usage('--log needs a value, got the option --no-force (write --log=--no-force if that is the value)'),
+    )
+    assert.throws(() => parseArgs(['--cell', '--debug']), /--cell needs a value, got the option --debug/)
+    assert.throws(() => parseArgs(['--scale', '--', 'x']), /--scale needs a value, got the option --/)
+    assert.equal(parseArgs(['--log=--odd.log']).logFile, '--odd.log')
+    assert.equal(parseArgs(['--log', '-', 'claude']).logFile, '-', 'a single dash is a value')
+    assert.equal(parseArgs(['--log', 'w.log', '--no-force']).force, false)
   })
 
   it('parses --scale auto|nearest|smooth (default auto) and rejects anything else', () => {

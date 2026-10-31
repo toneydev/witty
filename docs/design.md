@@ -26,7 +26,7 @@ pseudo-console that passes the kitty APC sequences through and translating them 
 | `src/kitty/decode.ts` | payload → RGBA: PNG (`f=100`), raw `f=24`/`f=32`, `o=z` inflate, `t=d` direct, `t=f`/`t=t` file |
 | `src/kitty/files.ts` | the file transport policy: which paths may be read (and `t=t` files deleted), uniform errors, timeout |
 | `src/image/resize.ts` | scale to the target pixel box, or only its top-left region: nearest-neighbour or smooth (box / bilinear), `auto` picks |
-| `src/sixel/quantize.ts` | median cut to ≤255 colors plus a transparent index |
+| `src/sixel/quantize.ts` | median cut to ≤255 colors plus a transparent index; each 6-bit cell maps to its exactly nearest colour, by a red-ordered search or, in blocks holding 16+ of the image's cells, through per-block candidate lists |
 | `src/sixel/encode.ts` | RGBA → sixel DCS string |
 | `src/term/metrics.ts` | learn the (fractional) cell size: `CSI 14 t` / `CSI 18 t`, else `CSI 16 t`, else `--cell` |
 | `src/term/emit.ts` | wrap a placement (clipped to the screen, cached): save cursor, sixel, restore cursor, move per kitty's cursor policy; encode a placeholder strip |
@@ -51,8 +51,9 @@ A placement is clipped to the screen as kitty clips it at the screen edge: with 
 size, only the top-left `min(c, screen columns)` × `min(r, screen rows)` cells are scaled
 (`resizeRegion`, the same filter taps as the whole box) and encoded, so one put never costs more
 than a screenful of sixel; the cursor still moves past the whole box. Encoded placements are cached
-per source image (an uncropped `a=p` reuses the stored image) under box, cell size, visible cells
-and cursor policy, LRU within 32 MiB, so repeated puts reuse their bytes.
+per stored image: a `place` event carries the stored image itself, with any `x,y,w,h` rectangle
+beside it, cut out only on a cache miss. The key is the source rectangle, box, cell size, visible
+cells and cursor policy, LRU within 32 MiB, so repeated puts, cropped or not, reuse their bytes.
 
 Scaling policy (`--scale`, default `auto`): `nearest` copies the source pixel under each target
 pixel's centre, `smooth` filters (box when shrinking, bilinear when growing, alpha premultiplied),
@@ -124,9 +125,21 @@ flushed at the chunk end (it may then come out as two strips). A held run is wri
 next item is a kitty command (the command ends it, and its bytes come first), when no new chunk has
 arrived for 25 ms (an idle timer, reset by every chunk, so a row that ends a frame is drawn even if
 the child goes quiet; if it fires while a command is in flight, the flush queues behind it), and at
-`end()`, which also clears the timer. If the
-cell size is wrong, strips are misaligned: the `--log` file records `cell size WxH (terminal reply)`
+`end()`, which also clears the timer. A held run is capped at 8 KiB (a 400-column row of cells
+with three diacritics fits); past that it is written out up to its last cell, which bounds both
+memory and the re-scan each chunk does of what is held. If the cell size is wrong, strips are
+misaligned: the `--log` file records `cell size WxH (terminal reply)`
 or `(fallback)` at startup.
+
+## Transmission
+
+A chunked upload (`m=1`) is continued only by transmit commands (`a` absent, `t`, `T`, `q`, `f`), as
+in kitty: a put or any other action between its chunks runs on its own and the upload goes on, and a
+delete aborts it. The chunks reach the decoder as they came. Each may end in its own base64 padding
+(kitty decodes chunk by chunk, while a decoder of the joined text stops at the first `=`), and a
+chunk may also stop mid-quantum: the characters past its last whole quantum carry into the next.
+Compressed raw data (`o=z` with `f=24`/`f=32`) must inflate to exactly `s*v*bpp` bytes, as in kitty:
+inflation stops there and more is `EINVAL`. A compressed PNG inflates up to the image limit.
 
 ## Responses
 
@@ -180,9 +193,10 @@ image (normal placements in `emit.ts`, virtual ones in `placeholders.ts`) is cap
 side and 16,777,216 pixels in area. A larger box is scaled down proportionally, and the image then
 draws smaller than its cells. For a virtual placement the strips are cut with a matching smaller
 cell, so they still tile. Decoded images are capped at 64 MiB of RGBA, payloads at 32 MiB, and the
-image store at 256 MiB and 4096 images (LRU; storing an image costs constant time while the store
-fits). No command walks the store: images are indexed by number (the newest with each `I`), by
-id in order (for `d=r`/`d=R` ranges) and by whether anything references them (for `d=a`/`d=A`). At most 4096 virtual placements are kept (past that the oldest is dropped, with a log line
+image store at 256 MiB and 4096 images (as in kitty, images without placements are evicted first,
+then the least recently used; storing an image costs constant time while the store fits). No
+command walks the store: images are indexed by number (the newest with each `I`), by id in order
+(for `d=r`/`d=R` ranges) and by whether anything references them (for `d=a`/`d=A`, and eviction). At most 4096 virtual placements are kept (past that the oldest is dropped, with a log line
 and a `delete`), and 1024 distinct placement ids per image (the rest are only counted, so the image
 stays referenced). The placeholder caches share 128 MiB and the encoded placement cache 32 MiB. A
 normal placement costs at most one screenful of sixel per put (see "Placement semantics").
@@ -197,7 +211,14 @@ line carries the helper's stderr and witty goes on without VT input.
 
 **The child command** (`host/resolve.ts`) is looked up in the `PATH` directories only, never the
 current directory; relative `PATH` entries (`.`, `bin`, `C:tools`) are skipped, since they would
-search it after all. A `.cmd`/`.bat` file (npm's `claude.cmd`) runs as
+search it after all. Only files witty can start count: a name ending in `.exe`, `.com`, `.cmd` or
+`.bat` is taken as is, and any other name, a dotted one like `python3.12` included, gets each of
+those `PATHEXT` extensions appended, in `PATHEXT` order. An extensionless file (the POSIX shim npm
+puts beside `claude.cmd`) or a `.js`/`.vbs` that `PATHEXT` lists never shadows a program further
+on; a name that exists only as such a file is refused with `cannot start`. A program gets a
+command line quoted here per the MSVC rules (node-pty's own quoting leaves `"a b"` unquoted and
+drops a lone space; with no arguments node-pty gets `[]`, since an empty string would leave the
+path itself unquoted). A `.cmd`/`.bat` file (npm's `claude.cmd`) runs as
 `cmd.exe /d /e:on /v:off /s /c ""<file>" <args>"`, with `ComSpec` or else
 `%SystemRoot%\System32\cmd.exe`. cmd parses the arguments twice, once on that line and again where
 the batch file expands `%*`, so they are quoted the way Rust does since CVE-2024-24576: anything
@@ -211,6 +232,24 @@ file that turns on delayed expansion itself, or re-parses `%1` carelessly, is be
 `PATH` directories only: a bare `node` (or `where node`) would let cmd.exe run a `node.exe`,
 `node.cmd` or `node.bat` planted in the current directory, even when witty was started from
 PowerShell. It starts node with the caller's environment unchanged.
+
+**The installer** (`install.ps1`) moves an existing install aside (`witty.old-<stamp>-<pid>`)
+before copying the new one, then deletes it as far as it can: Windows renames a folder whose files
+a running witty holds (`conpty.node`, `OpenConsole.exe`), while deleting it in place stopped at the
+first of them with `dist\` already gone. What is still held is removed by the next install or
+uninstall.
+
+## Exit
+
+witty exits with the child's exit code. A child that never started (node-pty reports the failed
+`CreateProcess` as an exit with the Win32 error code) also prints `witty: could not start <file>
+(error N)`, and an exit code that never arrives is taken as 1, not success. Input that reaches the
+child as it exits (typing, a paste, a kitty response) is dropped: the write fails on node-pty's
+input pipe once the pseudo-console is gone, which used to crash witty. Ctrl+Break (SIGBREAK),
+SIGINT and closing the window (SIGHUP) kill the child and leave the normal way, with its code; if it
+has not exited 1.5 s later, or on a second signal, witty leaves with 128+n. Leaving without the
+child (a crash, that fallback) first writes a terminal reset (cursor shown, mouse, focus and paste
+reporting off, a kitty keyboard level popped, the main screen back), since the killed child cannot.
 
 ## Environment of the child
 
@@ -241,6 +280,11 @@ after about 100 ms. `--no-inherit-cursor` turns it off.
 - The inner ConPTY re-paints from its own buffer. If it ever repaints the cells under an image with
   spaces, the terminal erases the image there. Claude Code does not resend an unchanged image, so a
   repaint would leave a hole until the next redraw.
+- The terminal's saved cursor: a placement and a placeholder strip both go back with `ESC 7` …
+  `ESC 8`, because terminals disagree about where a sixel leaves the cursor. A child that saves its
+  cursor (`ESC 7` or `CSI s`), writes an image and then restores it lands at the image instead (the
+  ConPTY passes both through). kitty never touches the saved cursor. Claude Code has not been seen
+  doing this.
 - Outer input: on Node 24 raw mode passes the VT byte stream through; mouse and kitty-keyboard bytes
   were verified end to end in the tests. Older Node may need the fallback in `host/console.ts`, which
   sets `ENABLE_VIRTUAL_TERMINAL_INPUT` through a hidden PowerShell helper.
@@ -262,8 +306,13 @@ Preference:
 2. else the `CSI 16 t` reply;
 3. else `--cell` (decimals allowed, e.g. `9.375x20`).
 
-Replies seen later on the input (the child asked) are followed: a text area re-derives the cell
-size; a `CSI 16 t` reply replaces it, unless the current size came from the text area and the reply
+Replies seen later on the input are followed. The terminal answers in order, so the first reply of
+each kind witty asked for and has not yet seen is still witty's, however late: it is taken out of
+the input instead of reaching the child (while one is owed, a read ending in what can only be the
+start of it is held up to 100 ms for the rest). Every later reply went to the child, which asked.
+Only `ESC [` counts as the introducer, never a 0x9b byte, which in UTF-8 input is part of a
+character. A text area re-derives the cell size (divided by the cell count from the same batch, if
+any); a `CSI 16 t` reply replaces it, unless the current size came from the text area and the reply
 is only its rounding (within a pixel per side). Every reply and the chosen size, with three
 decimals, are logged (`cell size 9.373x20.000 (text area)`).
 

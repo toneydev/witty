@@ -204,6 +204,16 @@ test('maxColors caps the palette', () => {
   assert.equal(exact.decoded.palette.size, 4)
 })
 
+test('a non-finite maxColors means the default 256, never more registers', () => {
+  const rand = rng(17)
+  const image = make(40, 40, () => [Math.floor(rand() * 256), Math.floor(rand() * 256), Math.floor(rand() * 256), 255])
+  for (const maxColors of [NaN, Infinity]) {
+    const { text, decoded } = roundTrip(image, { maxColors })
+    assert.equal(decoded.palette.size, 256, `maxColors ${maxColors}`)
+    assert.equal(text, encodeSixel(image))
+  }
+})
+
 test('output is deterministic and the string matches the bytes', () => {
   const rand = rng(3)
   const image = make(50, 20, () => [Math.floor(rand() * 256), Math.floor(rand() * 256), 0, 255])

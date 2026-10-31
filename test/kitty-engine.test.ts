@@ -140,6 +140,48 @@ test('chunked: over the payload limit answers EFBIG once, at the end', async () 
   assert.deepEqual(places(events), [])
 })
 
+test('chunked: each chunk may end in its own base64 padding, as kitty decodes chunk by chunk', async () => {
+  const e = engine()
+  const data = gradient(4, 4)
+  // 16-byte raw pieces: every chunk is a multiple of 4 characters and ends in `==`.
+  const parts = [0, 16, 32, 48].map((at) => b64(data.subarray(at, at + 16)))
+  assert.ok(parts.every((part) => part.endsWith('==')))
+  for (const [k, part] of parts.entries()) {
+    const keys = k === 0 ? 'a=T,f=32,s=4,v=4,i=9,m=1' : k < 3 ? 'm=1' : 'm=0'
+    const events = await send(e, `${keys};${part}`)
+    if (k < 3) {
+      assert.deepEqual(events, [])
+      continue
+    }
+    assert.deepEqual(places(events)[0]?.image.data, data)
+    assert.deepEqual(responses(events), [response('i=9;OK')])
+  }
+})
+
+test('chunked: a put between the chunks runs on its own and the upload goes on', async () => {
+  const e = engine()
+  await send(e, `a=t,f=32,s=1,v=1,i=1,q=2;${b64(Uint8Array.of(1, 2, 3, 255))}`)
+  const data = gradient(8, 8)
+  const text = b64(data)
+  assert.deepEqual(await send(e, `a=T,f=32,s=8,v=8,i=9,m=1;${text.slice(0, 100)}`), [])
+  const put = await send(e, 'a=p,i=1')
+  assert.deepEqual(kinds(put), ['place', 'respond'])
+  assert.deepEqual(responses(put), [response('i=1;OK')])
+  const events = await send(e, `m=0;${text.slice(100)}`)
+  assert.deepEqual(places(events)[0]?.image.data, data)
+  assert.deepEqual(responses(events), [response('i=9;OK')])
+})
+
+test('o=z raw data inflates to exactly s*v*bpp bytes; more is refused', async () => {
+  const e = engine()
+  const data = gradient(3, 2)
+  assert.deepEqual(places(await send(e, `a=T,f=32,s=3,v=2,o=z;${b64(deflateSync(data))}`))[0]?.image.data, data)
+  const longer = await send(e, `a=T,f=32,s=3,v=1,o=z,i=1;${b64(deflateSync(data))}`)
+  assert.match(responses(longer)[0] ?? '', /^\x1b_Gi=1;EINVAL:/)
+  const shorter = await send(e, `a=T,f=32,s=3,v=3,o=z,i=1;${b64(deflateSync(data))}`)
+  assert.match(responses(shorter)[0] ?? '', /^\x1b_Gi=1;ENODATA:/)
+})
+
 test('a delete aborts a partial chunked upload', async () => {
   const e = engine()
   await send(e, `a=T,f=32,s=1,v=1,i=1,m=1;AAAA`)
@@ -339,21 +381,23 @@ test('t=t deletes the file only when the path names tty-graphics-protocol', asyn
   assert.deepEqual(deleted, ['/tmp/tty-graphics-protocol-abc.png'])
 })
 
-test('source rectangle x,y,w,h crops the image', async () => {
+test('source rectangle x,y,w,h: the stored image plus the rectangle, not a crop', async () => {
   const e = engine()
   await send(e, `a=t,f=32,s=6,v=5,i=1;${b64(gradient(6, 5))}`)
   const [place] = places(await send(e, 'a=p,i=1,x=2,y=1,w=3,h=2'))
   assert.ok(place)
-  assert.equal(place.image.width, 3)
-  assert.equal(place.image.height, 2)
-  // pixel (0,0) of the crop is (2,1) of the source; (2,1) of the crop is (4,2).
-  assert.deepEqual([...place.image.data.subarray(0, 4)], [2, 1, 3, 255])
-  assert.deepEqual([...place.image.data.subarray((1 * 3 + 2) * 4, (1 * 3 + 2) * 4 + 4)], [4, 2, 6, 255])
+  assert.deepEqual(place.source, { x: 2, y: 1, width: 3, height: 2 })
+  assert.deepEqual([place.image.width, place.image.height], [6, 5], 'the stored image')
+  assert.deepEqual(place.image.data, gradient(6, 5))
+  // Every put of the image carries the same object, so the emitter's cache can hit.
+  const [again] = places(await send(e, 'a=p,i=1,x=2,y=1,w=3,h=2'))
+  assert.equal(again?.image, place.image)
 
-  // A rectangle past the edge is clipped to the image.
+  // A rectangle past the edge is clipped to the image; the whole image needs none.
   const [clipped] = places(await send(e, 'a=p,i=1,x=4,y=3,w=100,h=100'))
-  assert.equal(clipped?.image.width, 2)
-  assert.equal(clipped?.image.height, 2)
+  assert.deepEqual(clipped?.source, { x: 4, y: 3, width: 2, height: 2 })
+  const [whole] = places(await send(e, 'a=p,i=1,x=0,y=0,w=6,h=5'))
+  assert.ok(whole && !('source' in whole))
 
   assert.match(responses(await send(e, 'a=p,i=1,x=6'))[0] ?? '', /^\x1b_Gi=1;EINVAL:/)
 })
@@ -497,7 +541,8 @@ test('evicting an image with virtual placements reports a delete', async () => {
   const e = engine({ maxStoreBytes: 2 * 400 })
   const image = b64(gradient(10, 10))
   await send(e, `a=T,U=1,f=32,s=10,v=10,i=1,q=2;${image}`)
-  await send(e, `a=t,f=32,s=10,v=10,i=2,q=2;${image}`)
+  // Placed too, so it is not freed ahead of image 1 for having no placements.
+  await send(e, `a=T,U=1,f=32,s=10,v=10,i=2,q=2;${image}`)
   const events = await send(e, `a=t,f=32,s=10,v=10,i=3,q=2;${image}`)
   assert.deepEqual(kinds(events), ['delete'])
   assert.deepEqual(events.find((ev) => ev.kind === 'delete'), { kind: 'delete', imageIds: [1] })
@@ -566,9 +611,11 @@ test('virtual placements share the stored image: a source rectangle, not a copy'
     assert.deepEqual(v.source, { x: 1, y: 0, width: 63, height: 64 })
   }
   assert.deepEqual([events[0]!.image.width, events[0]!.image.height], [64, 64])
-  // The whole image needs no rectangle; a normal placement still gets its crop.
+  // The whole image needs no rectangle; a normal placement shares it the same way.
   assert.equal(virtuals(await send(e, 'a=p,U=1,i=7,p=9,q=2'))[0]?.source, undefined)
-  assert.deepEqual([...(places(await send(e, 'a=p,i=7,x=1,y=2,w=1,h=1,q=2'))[0]?.image.data ?? [])], [1, 2, 3, 255])
+  const [normal] = places(await send(e, 'a=p,i=7,x=1,y=2,w=1,h=1,q=2'))
+  assert.equal(normal?.image, events[0]!.image)
+  assert.deepEqual(normal?.source, { x: 1, y: 2, width: 1, height: 1 })
 })
 
 test('virtual placements are bounded: past the bound the oldest is dropped with a delete', async () => {
@@ -607,17 +654,24 @@ test('the default bound on virtual placements holds against a flood of puts', as
   assert.equal(dropped, 10)
 })
 
-test('the number of stored images is bounded: past it the least recently used is evicted', async () => {
+test('the number of stored images is bounded: images without placements go first, then the least recently used', async () => {
   const e = engine({ maxImages: 3 })
   const pixel = b64(Uint8Array.of(1, 2, 3, 255))
   await send(e, `a=T,U=1,f=32,s=1,v=1,i=1,q=2;${pixel}`)
   for (const i of [2, 3]) await send(e, `a=t,f=32,s=1,v=1,i=${i},q=2;${pixel}`)
-  await send(e, 'a=p,i=2,q=2') // touch 2: 1 is the oldest, then 3
-  const events = await send(e, `a=t,f=32,s=1,v=1,i=4,q=2;${pixel}`)
+  // Image 1 is the oldest, but still shown through its virtual placement (kitty
+  // frees images without placements first): 2 goes.
+  let events = await send(e, `a=t,f=32,s=1,v=1,i=4,q=2;${pixel}`)
+  assert.equal(events.find((ev) => ev.kind === 'delete'), undefined)
+  assert.match(responses(await send(e, 'a=p,i=2'))[0] ?? '', /ENOENT/)
+  // Once every other image is placed, the least recently used goes: 1.
+  await send(e, 'a=p,i=3,q=2')
+  await send(e, 'a=p,i=4,q=2')
+  events = await send(e, `a=t,f=32,s=1,v=1,i=5,q=2;${pixel}`)
   // Image 1 had a virtual placement: its placeholders show nothing from now on.
   assert.deepEqual(events.find((ev) => ev.kind === 'delete'), { kind: 'delete', imageIds: [1] })
   assert.match(responses(await send(e, 'a=p,i=1'))[0] ?? '', /ENOENT/)
-  for (const i of [2, 3, 4]) assert.deepEqual(kinds(await send(e, `a=p,i=${i}`)), ['place', 'respond'], `i=${i}`)
+  for (const i of [3, 4, 5]) assert.deepEqual(kinds(await send(e, `a=p,i=${i}`)), ['place', 'respond'], `i=${i}`)
   // The default bound.
   const d = engine()
   for (let i = 1; i <= DEFAULT_MAX_IMAGES + 1; i++) await send(d, `a=t,f=32,s=1,v=1,i=${i},q=2;${pixel}`)

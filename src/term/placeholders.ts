@@ -43,8 +43,19 @@ import { encodePlaceholderStrip, placementGeometry, scaleToBox } from './emit.ts
 /** U+10EEEE in UTF-8. */
 const PLACEHOLDER = [0xf4, 0x8e, 0xbb, 0xae] as const
 
-/** A held run longer than this is flushed up to its last cell, to bound memory. */
-const MAX_HOLD_BYTES = 64 * 1024
+/**
+ * A held run longer than this is flushed up to its last cell. It bounds memory
+ * and the work of each chunk, which re-scans what is held. A 400-column row of
+ * cells with three diacritics (about 10 bytes each) fits.
+ */
+export const MAX_HOLD_BYTES = 8 * 1024
+
+/** CSI parameter bytes kept per sequence (the rest are dropped). */
+const MAX_CSI_PARAMS = 256
+
+const ESC = 0x1b
+const SEMICOLON = 0x3b
+const COLON = 0x3a
 
 /** Encoded strips kept per placement before the cache is cleared. */
 const MAX_STRIPS_PER_PLACEMENT = 1024
@@ -227,7 +238,7 @@ function codePointAt(buf: Uint8Array, i: number): { cp: number; size: number } |
 
 /** A colour from SGR parameters: an index (basic or 256-colour) or a packed 24-bit RGB, as an id. */
 function rgbId(r: number, g: number, b: number): number | null {
-  if (![r, g, b].every((v) => Number.isInteger(v) && v >= 0 && v <= 255)) return null
+  if (indexId(r) === null || indexId(g) === null || indexId(b) === null) return null
   return ((r << 16) | (g << 8) | b) >>> 0
 }
 
@@ -259,7 +270,9 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
 
   // Terminal state, tracked as it passes.
   let state = GROUND
-  let csiParams = ''
+  /** The parameter bytes (0x30-0x3f) of the CSI sequence in progress, kept as bytes: no string per byte. */
+  const csiParams = new Uint8Array(MAX_CSI_PARAMS)
+  let csiLength = 0
   let csiIntermediate = false
   let fg: number | undefined
   let ul: number | undefined
@@ -308,23 +321,63 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
     if (cachedBytes > maxCacheBytes) dropCache(current)
   }
 
-  const applySgr = (params: string): void => {
-    const parts = params === '' ? [''] : params.split(';')
-    for (let k = 0; k < parts.length; k++) {
-      const part = parts[k]!
-      if (part.includes(':')) {
-        const sub = part.split(':')
-        const code = Number(sub[0] === '' ? '0' : sub[0])
-        if (code === 38 || code === 58) {
+  // The `;`-separated parts of the SGR being applied: where each lies in
+  // `csiParams` and its number (0 when empty, NaN unless all digits).
+  const partStart = new Int32Array(MAX_CSI_PARAMS + 1)
+  const partEnd = new Int32Array(MAX_CSI_PARAMS + 1)
+  const partValue = new Float64Array(MAX_CSI_PARAMS + 1)
+  let partCount = 0
+
+  /** Part `k` as a number, NaN when there is no such part. */
+  const partNumber = (k: number): number => (k < partCount ? partValue[k]! : NaN)
+
+  /** Whether part `k` is exactly the one byte `b` (`5` in `38;5;n`, say). */
+  const partIs = (k: number, b: number): boolean =>
+    k < partCount && partEnd[k]! - partStart[k]! === 1 && csiParams[partStart[k]!] === b
+
+  /**
+   * Applies the SGR in `csiParams` to the tracked colours. SGR is most of a
+   * TUI's escape traffic, so the parameters are read as numbers straight from
+   * the bytes; only a part with `:` sub-parameters (rare) becomes a string.
+   */
+  const applySgr = (): void => {
+    partCount = 0
+    let start = 0
+    let value = 0
+    let digits = true
+    for (let p = 0; p <= csiLength; p++) {
+      const b = p < csiLength ? csiParams[p]! : SEMICOLON
+      if (b === SEMICOLON) {
+        partStart[partCount] = start
+        partEnd[partCount] = p
+        partValue[partCount] = digits ? value : NaN
+        partCount++
+        start = p + 1
+        value = 0
+        digits = true
+      } else if (b >= 0x30 && b <= 0x39) {
+        value = value * 10 + (b - 0x30)
+      } else {
+        digits = false
+      }
+    }
+    for (let k = 0; k < partCount; k++) {
+      const code = partValue[k]!
+      if (Number.isNaN(code)) {
+        // Not a plain number: `38:2::r:g:b` and the like, or a stray private marker (ignored).
+        const part = csiParams.subarray(partStart[k]!, partEnd[k]!)
+        if (!part.includes(COLON)) continue
+        const sub = String.fromCharCode(...part).split(':')
+        const subCode = Number(sub[0] === '' ? '0' : sub[0])
+        if (subCode === 38 || subCode === 58) {
           const color = colonColor(sub)
           if (color !== null) {
-            if (code === 38) fg = color
+            if (subCode === 38) fg = color
             else ul = color
           }
         }
         continue
       }
-      const code = part === '' ? 0 : Number(part)
       if (code === 0) {
         fg = undefined
         ul = undefined
@@ -337,13 +390,12 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
       } else if (code === 59) {
         ul = undefined
       } else if (code === 38 || code === 48 || code === 58) {
-        const mode = parts[k + 1]
         let color: number | null = null
-        if (mode === '5') {
-          color = indexId(Number(parts[k + 2] ?? 'x'))
+        if (partIs(k + 1, 0x35)) {
+          color = indexId(partNumber(k + 2))
           k += 2
-        } else if (mode === '2') {
-          color = rgbId(Number(parts[k + 2] ?? 'x'), Number(parts[k + 3] ?? 'x'), Number(parts[k + 4] ?? 'x'))
+        } else if (partIs(k + 1, 0x32)) {
+          color = rgbId(partNumber(k + 2), partNumber(k + 3), partNumber(k + 4))
           k += 4
         } else {
           k += 1
@@ -455,6 +507,8 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
     const pieces: Uint8Array[] = []
     let emitFrom = 0
     let run: Run | null = null
+    /** Whether any piece is a replacement (a strip or spaces) rather than a slice of `buf`. */
+    let replaced = false
 
     /** Writes out the current run (which ends where its last cell ends), strip by strip. */
     const endRun = (): void => {
@@ -487,6 +541,7 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
         } else {
           try {
             pieces.push(stripBytes(placement, head.row, head.column, e - s))
+            replaced = true
           } catch (error) {
             log(`placeholder strip failed: ${error instanceof Error ? error.message : String(error)}`)
             pieces.push(raw)
@@ -567,15 +622,25 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
             continue
           }
           endRun()
-          if (b === 0x1b) state = ESCAPE
-          else prev = null
           i++
+          if (b === ESC) {
+            state = ESCAPE
+            continue
+          }
+          prev = null
+          // Fast path: the bytes up to the next ESC or F4 are plain text (every
+          // other byte of a UTF-8 character is neither), with nothing to track.
+          while (i < len) {
+            const c = buf[i]!
+            if (c === ESC || c === 0xf4) break
+            i++
+          }
           continue
         }
         case ESCAPE: {
           if (b === 0x5b) {
             state = CSI
-            csiParams = ''
+            csiLength = 0
             csiIntermediate = false
           } else if (b === 0x5d || b === 0x50 || b === 0x58 || b === 0x5e || b === 0x5f) {
             state = STRING
@@ -598,12 +663,13 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
         }
         case CSI: {
           if (b >= 0x30 && b <= 0x3f) {
-            if (csiParams.length < 256) csiParams += String.fromCharCode(b)
+            if (csiLength < MAX_CSI_PARAMS) csiParams[csiLength++] = b
           } else if (b >= 0x20 && b <= 0x2f) {
             csiIntermediate = true
           } else if (b >= 0x40 && b <= 0x7e) {
-            const isSgr = b === 0x6d && !csiIntermediate && !/^[<=>?]/.test(csiParams)
-            if (isSgr) applySgr(csiParams)
+            // SGR is `m` with no intermediate and no private marker (`<=>?`, 0x3c-0x3f) first.
+            const isSgr = b === 0x6d && !csiIntermediate && !(csiLength > 0 && csiParams[0]! >= 0x3c)
+            if (isSgr) applySgr()
             else prev = null
             state = GROUND
           } else if (b === 0x1b) {
@@ -640,9 +706,12 @@ export function createPlaceholderPass(options: PlaceholderPassOptions): Placehol
       if (emitFrom < len) pieces.push(buf.subarray(emitFrom, len))
     }
 
-    if (pieces.length === 1 && pieces[0]!.length === buf.length) return buf
     let total = 0
     for (const piece of pieces) total += piece.length
+    // Nothing replaced: every piece is the next slice of `buf`, so together
+    // they are its first `total` bytes (all of it unless some are held). The
+    // length alone cannot tell, since a strip may be as long as its cells.
+    if (!replaced) return total === len ? buf : buf.subarray(0, total)
     const out = new Uint8Array(total)
     let at = 0
     for (const piece of pieces) {

@@ -136,6 +136,25 @@ test('an oversized APC is abandoned and passed through as text', () => {
   ])
 })
 
+test('aborted APCs within a chunk stay in its text, uncopied', () => {
+  // 64 KiB of `ESC _ G` each aborted by the next ESC. Each abort once copied
+  // all the text before it (quadratic: about 270 ms for this chunk).
+  const unit = '\x1b_Gx\x1b[m'
+  const chunk = bytes(unit.repeat(Math.floor(65536 / unit.length)))
+  const splitter = createSplitter()
+  const items = splitter.push(chunk)
+  assert.equal(items.length, 1)
+  const item = items[0]!
+  assert.ok(item.kind === 'text')
+  assert.equal(item.data.buffer, chunk.buffer, 'a view of the pushed chunk, not a copy')
+  assert.equal(latin(item.data), latin(chunk))
+  assert.deepEqual(splitter.flush(), [])
+  // Spread over chunks (APCs carried across a boundary, then aborted), the bytes are the same.
+  const chunks: Uint8Array[] = []
+  for (let k = 0; k < chunk.length; k += 4093) chunks.push(chunk.subarray(k, k + 4093))
+  assert.deepEqual(run(chunks), [{ text: latin(chunk) }])
+})
+
 test('oversized APC: held bytes are released as soon as the limit is crossed', () => {
   const splitter = createSplitter({ maxApcBytes: 4 })
   assert.deepEqual(splitter.push(bytes('\x1b_Gab')), [])

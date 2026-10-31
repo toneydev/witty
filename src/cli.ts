@@ -16,9 +16,31 @@ import { ensureVtInput, enterRawMode, leaveRawMode } from './host/console.ts'
 import { spawnChild, type ChildPty } from './host/pty.ts'
 import { resolveCommand, type ResolvedCommand } from './host/resolve.ts'
 import { createPipeline, type WireFactory } from './pipeline.ts'
-import { describeReport, formatCell, learnCellSize, parseWindowReports, trackCellSize, type CellSource } from './term/metrics.ts'
+import { describeReport, formatCell, learnCellSize, ReplyFilter, trackCellSize, type CellSource } from './term/metrics.ts'
 
 type Log = (line: string) => void
+
+/**
+ * What a child killed under us cannot undo itself, written on the ways out
+ * that skip its own cleanup (a crash, a signal that outlasts the child):
+ * back from the alternate screen, cursor shown, mouse reporting
+ * (1000/1002/1003/1006), focus reporting (1004) and bracketed paste (2004)
+ * off, one kitty keyboard level popped. `ESC 7` comes first because leaving
+ * the alternate screen also restores the main screen's saved cursor, and when
+ * the main screen is already showing that is wherever the last `ESC 7` (an
+ * image placement, say) left it; saving the cursor first makes it stay put.
+ */
+const TERMINAL_RESET =
+  '\x1b7\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[<u'
+
+/** After SIGINT, SIGBREAK or SIGHUP, how long the child's exit may take before witty leaves without it. */
+const SIGNAL_EXIT_MS = 1500
+
+/**
+ * How long a chunk ending in the start of an awaited size report is held for
+ * the rest of it, before it goes to the child after all.
+ */
+const REPLY_HOLD_MS = 100
 
 function readVersion(): string {
   try {
@@ -92,15 +114,54 @@ async function main(argv: readonly string[]): Promise<void> {
 
   // From here on the console is ours: restore it on every way out.
   let child: ChildPty | undefined
-  const crash = (error: unknown) => {
+  /**
+   * The way out that does not wait for the child: raw mode off and, once a
+   * child has run (it is being killed and cannot clean up after itself), the
+   * terminal modes it may have left on reset; then `message`, then exit.
+   */
+  const leaveNow = (code: number, message?: string): never => {
     leaveRawMode()
+    if (child !== undefined) {
+      try {
+        process.stdout.write(TERMINAL_RESET)
+      } catch {
+        // The terminal is gone.
+      }
+    }
+    if (message !== undefined) process.stderr.write(message)
+    process.exit(code)
+  }
+  const crash = (error: unknown) => {
     log(`fatal: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`)
-    process.stderr.write(`\nwitty: ${error instanceof Error ? error.message : String(error)}\n`)
     child?.kill()
-    process.exit(1)
+    leaveNow(1, `\nwitty: ${error instanceof Error ? error.message : String(error)}\n`)
   }
   process.on('uncaughtException', crash)
   process.on('unhandledRejection', crash)
+
+  // Raw mode turns Ctrl+C into a byte for the child, but Ctrl+Break still
+  // raises CTRL_BREAK_EVENT (SIGBREAK), another process can send CTRL_C_EVENT
+  // (SIGINT), and closing the window sends SIGHUP. Node's default for each is
+  // to end the process on the spot, raw mode and all. Instead the child is
+  // killed and its exit takes the normal way out (exit code included); if it
+  // has not come after SIGNAL_EXIT_MS, or a second signal arrives, witty
+  // leaves without it.
+  let stopping = false
+  const onSignal = (signal: NodeJS.Signals) => {
+    const code = 128 + (os.constants.signals[signal] ?? 0)
+    if (child === undefined || stopping) {
+      log(`${signal}, leaving now`)
+      return leaveNow(code)
+    }
+    stopping = true
+    log(`${signal}, killing the child`)
+    child.kill()
+    setTimeout(() => {
+      log(`${signal}: the child has not exited after ${SIGNAL_EXIT_MS} ms, leaving`)
+      leaveNow(code)
+    }, SIGNAL_EXIT_MS)
+  }
+  for (const signal of ['SIGINT', 'SIGBREAK', 'SIGHUP'] as const) process.on(signal, onSignal)
 
   enterRawMode()
   log(await ensureVtInput(options.vtInput))
@@ -135,7 +196,38 @@ async function main(argv: readonly string[]): Promise<void> {
   })
   child = spawned
   log(`spawned at ${cols}x${rows}, bundled conpty ${spawned.bundledConpty}, inherit cursor ${options.inheritCursor}`)
-  if (learned.leftover.length > 0) spawned.write(learned.leftover)
+
+  // Input for the child. Answers to the startup queries that missed the
+  // window are still witty's (the terminal answers in order) and are taken
+  // out; later ones went to whoever asked (the child) and pass on. Either
+  // way they keep the cell size current.
+  const replies = new ReplyFilter(learned.missing)
+  let replyTimer: ReturnType<typeof setTimeout> | undefined
+  const forwardInput = (bytes: Uint8Array): void => {
+    clearTimeout(replyTimer)
+    const { forward, reports, consumed } = replies.push(bytes)
+    if (reports.length > 0) {
+      for (const report of reports) {
+        log(`reply ${describeReport(report)} (${consumed.includes(report) ? 'late answer to witty, consumed' : 'seen on input'})`)
+      }
+      const screen = { columns: process.stdout.columns || 0, rows: process.stdout.rows || 0 }
+      const next = trackCellSize({ cell, source: cellSource }, reports, screen)
+      if (next.cell.width !== cell.width || next.cell.height !== cell.height) {
+        cell = next.cell
+        cellSource = next.source
+        log(`cell size ${formatCell(cell)} (${cellSource}, seen on input)`)
+      }
+    }
+    if (forward.length > 0) spawned.write(forward)
+    if (replies.holding) {
+      // The start of an awaited report; if the rest does not follow, it was input after all.
+      replyTimer = setTimeout(() => {
+        const held = replies.flush()
+        if (held.length > 0) spawned.write(held)
+      }, REPLY_HOLD_MS)
+    }
+  }
+  if (learned.leftover.length > 0) forwardInput(learned.leftover)
 
   // Flow control: stop reading the child while stdout is full or while a
   // kitty command is being handled; the child blocks on its full pipe.
@@ -179,20 +271,7 @@ async function main(argv: readonly string[]): Promise<void> {
   })
 
   process.stdin.on('data', (chunk: Buffer | string) => {
-    const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk
-    // Passively track the cell size when anyone (the child, usually) asks for it.
-    const reports = parseWindowReports(bytes)
-    if (reports.length > 0) {
-      for (const report of reports) log(`reply ${describeReport(report)} (seen on input)`)
-      const screen = { columns: process.stdout.columns || 0, rows: process.stdout.rows || 0 }
-      const next = trackCellSize({ cell, source: cellSource }, reports, screen)
-      if (next.cell.width !== cell.width || next.cell.height !== cell.height) {
-        cell = next.cell
-        cellSource = next.source
-        log(`cell size ${formatCell(cell)} (${cellSource}, seen on input)`)
-      }
-    }
-    spawned.write(bytes)
+    forwardInput(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk)
   })
   process.stdin.on('end', () => {
     log('stdin ended, killing the child')
@@ -207,18 +286,18 @@ async function main(argv: readonly string[]): Promise<void> {
     if (c > 0 && r > 0) spawned.resize(c, r)
   })
 
-  process.on('SIGHUP', () => {
-    log('SIGHUP, killing the child')
-    spawned.kill()
-    leaveRawMode()
-    process.exit(129)
-  })
-
   spawned.onExit((code) => {
     log(`child exited with ${code}`)
+    // node-pty reports a failed CreateProcess as an exit with the Win32 error code, and nothing else.
+    const notStarted = spawned.started ? undefined : `witty: could not start ${resolved.resolved} (error ${code})\n`
+    if (notStarted !== undefined) log(notStarted.trimEnd())
+    const leave = (): void => {
+      leaveRawMode()
+      if (notStarted !== undefined) process.stderr.write(notStarted)
+    }
     // Never wait forever on a stuck engine or a terminal that stopped reading.
     const deadline = setTimeout(() => {
-      leaveRawMode()
+      leave()
       process.exit(code)
     }, 3000)
     deadline.unref()
@@ -226,7 +305,7 @@ async function main(argv: readonly string[]): Promise<void> {
       .end()
       .catch((error: unknown) => log(`pipeline end: ${String(error)}`))
       .then(() => {
-        leaveRawMode()
+        leave()
         // The empty write's callback runs once everything before it is flushed.
         process.stdout.write('', () => process.exit(code))
       })

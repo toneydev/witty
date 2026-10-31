@@ -51,7 +51,8 @@ powershell -ExecutionPolicy Bypass -File .\witty-0.2.3-win-x64\install.ps1
 ```
 
 `install.ps1` copies the folder to `%LOCALAPPDATA%\Programs\witty` and adds it to your user PATH
-(`-Uninstall` reverses both); open a new terminal afterwards. The zip holds the compiled code and
+(`-Uninstall` reverses both); open a new terminal afterwards. Installing over a witty that is
+still running is fine: the old copy is moved aside and removed by the next install. The zip holds the compiled code and
 node-pty's prebuilt ConPTY, so the only requirement on the machine is `node.exe` on PATH; the
 launcher looks for it in the PATH directories only, never the current directory.
 
@@ -94,6 +95,9 @@ Without witty the Image slot shows its alt text; with witty it shows the sprite.
 | `--debug` | log diagnostics to `%TEMP%\witty.log` |
 | `--log <file>` | append diagnostics to `<file>` instead (implies `--debug`). The log records the command's arguments |
 | `--help`, `--version` | |
+
+Switches take no value (`--no-files=false` is an error), and an option's value given as the next
+argument cannot start with `--`; write `--log=--odd-name` for that.
 
 If placeholder images look misaligned, run with `--debug` and check the `cell size` line near the
 top of the log: `(fallback)` means the terminal did not report its cell size and `--cell` is in use.

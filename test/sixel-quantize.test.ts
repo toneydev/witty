@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { quantize } from '../src/sixel/quantize.ts'
+import { nearestSearch, quantize } from '../src/sixel/quantize.ts'
 import { make, rng, solid } from './helpers/images.ts'
 
 test('few colours: exact palette in first-appearance order', () => {
@@ -108,4 +108,87 @@ test('an all-transparent image has an empty palette', () => {
   const q = quantize(solid(3, 3, 1, 2, 3, 0), 256)
   assert.equal(q.palette.length, 0)
   assert.ok(q.indices.every((i) => i === q.transparentIndex))
+})
+
+/** The full search: the palette entry nearest the centre of 6-bit cell `cell`, lowest index on ties. */
+function bruteNearest(palette: Uint8Array, cell: number): number {
+  const centre = [(cell >> 12) & 63, (cell >> 6) & 63, cell & 63].map((v) => v * 4 + 1.5)
+  let best = Infinity
+  let index = 0
+  for (let k = 0; k < palette.length / 3; k++) {
+    const d = (palette[k * 3]! - centre[0]!) ** 2 + (palette[k * 3 + 1]! - centre[1]!) ** 2 + (palette[k * 3 + 2]! - centre[2]!) ** 2
+    if (d < best) {
+      best = d
+      index = k
+    }
+  }
+  return index
+}
+
+test('the nearest search is exact both ways it runs: red order and block candidate lists', () => {
+  const rand = rng(31)
+  const byte = () => Math.floor(rand() * 256)
+  const palettes = [
+    Uint8Array.from({ length: 256 * 3 }, byte),
+    Uint8Array.from({ length: 255 * 3 }, byte),
+    Uint8Array.from({ length: 16 * 3 }, byte),
+    Uint8Array.from([0, 0, 0, 255, 255, 255]),
+    // Clustered, with duplicates and entries on cell boundaries: ties are common.
+    Uint8Array.from({ length: 200 * 3 }, () => 64 + Math.floor(rand() * 8) * 4),
+  ]
+  for (const [p, palette] of palettes.entries()) {
+    const red = nearestSearch(palette, () => false)
+    const lists = nearestSearch(palette, () => true)
+    // Every cell for the first palette, a fixed sample of cells for the rest.
+    const step = p === 0 ? 1 : 7
+    for (let cell = 0; cell < 1 << 18; cell += step) {
+      const expected = bruteNearest(palette, cell)
+      if (red(cell) !== expected || lists(cell) !== expected) {
+        assert.fail(`palette ${p} cell ${cell}: red ${red(cell)}, lists ${lists(cell)}, expected ${expected}`)
+      }
+    }
+  }
+})
+
+test('a photo-sized image (block lists in use) maps every pixel to the nearest entry of its cell', () => {
+  const rand = rng(41)
+  const image = make(512, 256, (x, y) => [
+    Math.min(255, Math.max(0, x / 2 + (rand() - 0.5) * 60)),
+    Math.min(255, Math.max(0, y + (rand() - 0.5) * 60)),
+    Math.floor(128 + 100 * Math.sin(x / 40 + y / 30) + (rand() - 0.5) * 30),
+    255,
+  ])
+  const q = quantize(image, 256)
+  const seen = new Map<number, number>()
+  for (let i = 0; i < image.width * image.height; i++) {
+    const d = image.data
+    const cell = ((d[i * 4]! >> 2) << 12) | ((d[i * 4 + 1]! >> 2) << 6) | (d[i * 4 + 2]! >> 2)
+    let expected = seen.get(cell)
+    if (expected === undefined) {
+      expected = bruteNearest(q.palette, cell)
+      seen.set(cell, expected)
+    }
+    if (q.indices[i] !== expected) assert.fail(`pixel ${i}: ${q.indices[i]} instead of ${expected}`)
+  }
+  assert.ok(seen.size > 16384, `the image should use many cells (${seen.size})`)
+})
+
+test('median cut on an opaque image: transparentIndex stays above a 256-entry palette', () => {
+  const rand = rng(43)
+  const image = make(64, 64, () => [Math.floor(rand() * 256), Math.floor(rand() * 256), Math.floor(rand() * 256), 255])
+  const q = quantize(image, 256)
+  assert.equal(q.palette.length / 3, 256)
+  assert.equal(q.transparentIndex, 256)
+  const transparent = quantize({ ...image, data: image.data.map((v, i) => (i === 3 ? 0 : v)) }, 256)
+  assert.ok(transparent.palette.length / 3 <= 255)
+  assert.equal(transparent.transparentIndex, 255)
+})
+
+test('a non-finite maxColors means the default, never an unbounded palette', () => {
+  const rand = rng(47)
+  const image = make(40, 40, () => [Math.floor(rand() * 256), Math.floor(rand() * 256), Math.floor(rand() * 256), 255])
+  for (const max of [NaN, Infinity, -Infinity]) {
+    const q = quantize(image, max)
+    assert.deepEqual(q, quantize(image, 256), `maxColors ${max}`)
+  }
 })

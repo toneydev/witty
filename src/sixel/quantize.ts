@@ -13,7 +13,10 @@
 //    each box's palette colour is the mean of the pixels in it. Pixels are
 //    then mapped to the nearest palette colour (squared RGB distance, lowest
 //    index on ties), cached per 6-bit histogram cell (the cell's centre is
-//    matched), so each cell is searched once.
+//    matched), so each cell is searched once. The search is exact either way
+//    it runs (see nearestSearch): outwards in red order, or, in blocks of
+//    cells the image uses many of (a photo uses most of the 2^18 cells),
+//    through the block's short list of entries that can be nearest in it.
 //
 // The per-cell tables are allocated once and only the cells an image uses
 // are touched (and reset after): allocating and scanning all 2^18 cells per
@@ -68,7 +71,9 @@ export function quantize(image: Rgba, maxColors: number, opts: QuantizeOptions =
       break
     }
   }
-  const limit = Math.max(1, Math.min(hasTransparent ? 255 : 256, Math.floor(maxColors)))
+  // A non-finite maxColors (NaN) would make every comparison false and lift the cap.
+  const requested = Number.isFinite(maxColors) ? Math.floor(maxColors) : 256
+  const limit = Math.max(1, Math.min(hasTransparent ? 255 : 256, requested))
 
   const exact = exactPalette(data, count, threshold, limit, indices)
   if (exact) {
@@ -80,8 +85,8 @@ export function quantize(image: Rgba, maxColors: number, opts: QuantizeOptions =
   const cells = histogram(data, count, threshold, t)
   try {
     const palette = medianCut(cells, limit, t)
-    mapNearest(data, count, threshold, palette, indices, t.nearest)
-    return { palette, indices, transparentIndex: 255 }
+    mapNearest(data, count, threshold, palette, indices, t.nearest, cells)
+    return { palette, indices, transparentIndex: Math.max(255, palette.length / 3) }
   } finally {
     // Leave the shared tables clean for the next call.
     for (const c of cells) {
@@ -188,7 +193,13 @@ function histogram(data: Uint8Array, count: number, threshold: number, t: Tables
     sumG[c]! += g
     sumB[c]! += b
   }
-  return cells.subarray(0, used).sort()
+  // Ascending: sorting costs O(used log used) (10 ms for the 212k cells of a
+  // 1500x900 photo), scanning the table O(CELLS) (about 1 ms); scan once the
+  // image uses more than a sixteenth of the cells.
+  if (used * 16 < CELLS) return cells.subarray(0, used).sort()
+  let k = 0
+  for (let c = 0; c < CELLS; c++) if (hist[c] !== 0) cells[k++] = c
+  return cells.subarray(0, used)
 }
 
 /** The palette for the histogrammed `cells` (reordered in place). */
@@ -197,27 +208,47 @@ function medianCut(cells: Int32Array, limit: number, t: Tables): Uint8Array {
   const used = cells.length
   const sorted = new Int32Array(used)
 
+  // The squared error of each axis, all three in one pass over the cells.
   const measure = (start: number, end: number): Box => {
     if (end - start < 2) return { start, end, score: -1, axis: 0 }
+    let n = 0
+    let s0 = 0
+    let s1 = 0
+    let s2 = 0
+    let q0 = 0
+    let q1 = 0
+    let q2 = 0
+    for (let k = start; k < end; k++) {
+      const c = cells[k]!
+      const w = hist[c]!
+      const v0 = coord(c, 0)
+      const v1 = coord(c, 1)
+      const v2 = coord(c, 2)
+      n += w
+      s0 += w * v0
+      q0 += w * v0 * v0
+      s1 += w * v1
+      q1 += w * v1 * v1
+      s2 += w * v2
+      q2 += w * v2 * v2
+    }
+    const e0 = q0 - (s0 * s0) / n
+    const e1 = q1 - (s1 * s1) / n
+    const e2 = q2 - (s2 * s2) / n
+    // The first axis wins ties, as when they were measured one by one.
     let best = -1
     let bestAxis = 0
-    for (let axis = 0; axis < 3; axis++) {
-      let n = 0
-      let s = 0
-      let s2 = 0
-      for (let k = start; k < end; k++) {
-        const c = cells[k]!
-        const w = hist[c]!
-        const v = coord(c, axis)
-        n += w
-        s += w * v
-        s2 += w * v * v
-      }
-      const sse = s2 - (s * s) / n
-      if (sse > best) {
-        best = sse
-        bestAxis = axis
-      }
+    if (e0 > best) {
+      best = e0
+      bestAxis = 0
+    }
+    if (e1 > best) {
+      best = e1
+      bestAxis = 1
+    }
+    if (e2 > best) {
+      best = e2
+      bestAxis = 2
     }
     return { start, end, score: best, axis: bestAxis }
   }
@@ -294,11 +325,16 @@ function mapNearest(
   palette: Uint8Array,
   indices: Uint8Array,
   cache: Int16Array,
+  cells: Int32Array,
 ): void {
-  const n = palette.length / 3
-  const half = (1 << SHIFT) / 2 - 0.5
-  const byRed = Int32Array.from({ length: n }, (_, k) => k).sort((a, b) => palette[a * 3]! - palette[b * 3]! || a - b)
-  const reds = Int32Array.from(byRed, (k) => palette[k * 3]!)
+  // Cells per block: a block with enough of them gets a candidate list.
+  let listed = (_block: number): boolean => false
+  if (cells.length >= LIST_CELLS) {
+    const perBlock = new Uint32Array(BLOCKS * BLOCKS * BLOCKS)
+    for (let k = 0; k < cells.length; k++) perBlock[blockOf(cells[k]!)]!++
+    listed = (block) => perBlock[block]! >= LIST_CELLS
+  }
+  const nearest = nearestSearch(palette, listed)
   for (let i = 0; i < count; i++) {
     const p = i * 4
     if (data[p + 3]! < threshold) {
@@ -308,13 +344,121 @@ function mapNearest(
     const c = cellOf(data[p]!, data[p + 1]!, data[p + 2]!)
     let idx = cache[c]!
     if (idx < 0) {
-      const r = (coord(c, 0) << SHIFT) + half
-      const g = (coord(c, 1) << SHIFT) + half
-      const b = (coord(c, 2) << SHIFT) + half
-      idx = nearestIndex(palette, byRed, reds, r, g, b)
+      idx = nearest(c)
       cache[c] = idx
     }
     indices[i] = idx
+  }
+}
+
+/** Histogram levels per side of a block of cells in {@link nearestSearch}: 4, so 16^3 blocks. */
+const BLOCK = 4
+const BLOCKS = LEVELS / BLOCK
+
+/**
+ * The cells an image must use in a block for the block to get a candidate
+ * list. Building a list is one pass over the palette, about the cost of 11
+ * red-order searches (which visit ~40 of 256 entries on a photo), and then a
+ * cell visits ~4 entries, so a list pays from about a dozen cells. A
+ * placeholder strip uses a few cells per block and keeps the red-order search
+ * (lists for every block made a 75x20 strip 9x slower); a 1500x900 photo uses
+ * 212k of the 2^18 cells, and its mapping drops from 47 to about 15 ms.
+ */
+const LIST_CELLS = 16
+
+/** The block of BLOCK³ cells that `cell` lies in. */
+function blockOf(cell: number): number {
+  return (
+    (Math.floor(coord(cell, 0) / BLOCK) * BLOCKS + Math.floor(coord(cell, 1) / BLOCK)) * BLOCKS + Math.floor(coord(cell, 2) / BLOCK)
+  )
+}
+
+/** The 0..255 value at the centre of 6-bit level `v`. */
+function centre(v: number): number {
+  return (v << SHIFT) + (1 << SHIFT) / 2 - 0.5
+}
+
+/**
+ * Finds the palette entry nearest a histogram cell's centre (squared
+ * distance, lowest index on ties). Exported for tests.
+ *
+ * Cells of a block for which `listed(block)` is false are searched outwards
+ * in red order ({@link nearestIndex}). A listed block (of BLOCK³ cells) gets
+ * a candidate list on its first query: the entries whose distance to the nearest point of
+ * the block (the box spanned by its cell centres) is at most the smallest
+ * farthest-point distance of any entry. Every entry is within its
+ * farthest-point distance of any centre in the block, so the nearest entry
+ * of a centre, and every entry tied with it, is within that bound and on the
+ * list; scanning the list in index order gives the same answer as the full
+ * search. Locally sorted search, after Heckbert's median-cut paper.
+ */
+export function nearestSearch(palette: Uint8Array, listed: (block: number) => boolean): (cell: number) => number {
+  const n = palette.length / 3
+  const byRed = Int32Array.from({ length: n }, (_, k) => k).sort((a, b) => palette[a * 3]! - palette[b * 3]! || a - b)
+  const reds = Int32Array.from(byRed, (k) => palette[k * 3]!)
+  // Per block: its candidate list, RED for the red-order search, undefined until first asked.
+  const lists: (Int16Array | undefined)[] = new Array(BLOCKS * BLOCKS * BLOCKS)
+  const RED = new Int16Array(0)
+  const nearDistance = new Float64Array(n)
+  const low = new Float64Array(3)
+  const span = (BLOCK - 1) << SHIFT
+
+  const listOf = (block: number): Int16Array => {
+    low[0] = centre(Math.floor(block / (BLOCKS * BLOCKS)) * BLOCK)
+    low[1] = centre((Math.floor(block / BLOCKS) % BLOCKS) * BLOCK)
+    low[2] = centre((block % BLOCKS) * BLOCK)
+    let bound = Infinity
+    for (let k = 0; k < n; k++) {
+      let near = 0
+      let far = 0
+      for (let axis = 0; axis < 3; axis++) {
+        const v = palette[k * 3 + axis]!
+        const lo = low[axis]!
+        const hi = lo + span
+        const d = v < lo ? lo - v : v > hi ? v - hi : 0
+        near += d * d
+        const f = v - lo > hi - v ? v - lo : hi - v
+        far += f * f
+      }
+      nearDistance[k] = near
+      if (far < bound) bound = far
+    }
+    let size = 0
+    for (let k = 0; k < n; k++) if (nearDistance[k]! <= bound) size++
+    const list = new Int16Array(size)
+    size = 0
+    for (let k = 0; k < n; k++) if (nearDistance[k]! <= bound) list[size++] = k
+    return list
+  }
+
+  return (cell: number): number => {
+    const v0 = coord(cell, 0)
+    const v1 = coord(cell, 1)
+    const v2 = coord(cell, 2)
+    const r = centre(v0)
+    const g = centre(v1)
+    const b = centre(v2)
+    const block = (Math.floor(v0 / BLOCK) * BLOCKS + Math.floor(v1 / BLOCK)) * BLOCKS + Math.floor(v2 / BLOCK)
+    let list = lists[block]
+    if (list === undefined) {
+      list = listed(block) ? listOf(block) : RED
+      lists[block] = list
+    }
+    if (list === RED) return nearestIndex(palette, byRed, reds, r, g, b)
+    let best = Infinity
+    let idx = 0
+    for (let j = 0; j < list.length; j++) {
+      const k = list[j]!
+      const dr = palette[k * 3]! - r
+      const dg = palette[k * 3 + 1]! - g
+      const db = palette[k * 3 + 2]! - b
+      const d = dr * dr + dg * dg + db * db
+      if (d < best) {
+        best = d
+        idx = k
+      }
+    }
+    return idx
   }
 }
 

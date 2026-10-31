@@ -16,6 +16,8 @@ import {
   parseCellOption,
   parseCellSizeReply,
   parseWindowReports,
+  ReplyFilter,
+  STARTUP_KINDS,
   trackCellSize,
   type ByteSource,
 } from '../src/term/metrics.ts'
@@ -44,8 +46,12 @@ describe('parseCellSizeReply', () => {
     assert.deepEqual(r, { cell: { width: 9, height: 17 }, start: 5, end: 14 })
   })
 
-  it('accepts the 8-bit CSI introducer', () => {
-    assert.deepEqual(parseCellSizeReply(Uint8Array.of(0x9b, ...bytes('6;16;8t')))?.cell, { width: 8, height: 16 })
+  it('ignores a 0x9b byte: in UTF-8 input it is part of a character, never an 8-bit CSI', () => {
+    assert.equal(parseCellSizeReply(Uint8Array.of(0x9b, ...bytes('6;16;8t'))), undefined)
+    // Û is C3 9B, 💛 is F0 9F 92 9B: typed or pasted before `6;20;10t` they once read as a report.
+    for (const text of ['Û6;20;10t', '💛4;1;1t', 'ě8;12;30t', 'Л6;9;9t']) {
+      assert.deepEqual(parseWindowReports(Buffer.from(text, 'utf8')), [], text)
+    }
   })
 
   it('rejects partial, malformed and zero-sized replies', () => {
@@ -121,6 +127,74 @@ describe('size reports', () => {
     const fromReply = { cell: { width: 9, height: 20 }, source: 'terminal reply' as const }
     assert.deepEqual(trackCellSize(fromReply, parseWindowReports(bytes('\x1b[6;20;10t')), screen).cell, { width: 10, height: 20 })
   })
+
+  it('divides a text area by the cell count from the same batch, even when that comes after it', () => {
+    // The order the startup queries are answered in: 14 t, 18 t, 16 t. The screen here is not the terminal's size.
+    const fallback = { cell: { width: 8, height: 16 }, source: 'fallback' as const }
+    const reports = parseWindowReports(bytes('\x1b[4;760;1481t\x1b[8;38;158t\x1b[6;20;9t'))
+    const tracked = trackCellSize(fallback, reports, { columns: 80, rows: 24 })
+    assert.deepEqual(tracked, { cell: { width: 1481 / 158, height: 20 }, source: 'text area' })
+  })
+})
+
+describe('ReplyFilter', () => {
+  const text = (b: Uint8Array) => Buffer.from(b).toString('latin1')
+
+  it('consumes the first report of each owed kind and forwards later ones', () => {
+    const filter = new ReplyFilter(STARTUP_KINDS)
+    const first = filter.push(bytes('a\x1b[4;760;1481tb\x1b[8;38;158t\x1b[6;20;9tc'))
+    assert.equal(text(first.forward), 'abc')
+    assert.deepEqual(first.consumed.map((r) => r.kind), ['text-area', 'cells', 'cell'])
+    assert.deepEqual(first.reports.map((r) => r.kind), ['text-area', 'cells', 'cell'])
+    assert.equal(filter.pending.size, 0)
+    // The child asks next: its answers pass through, and are still reported for tracking.
+    const later = filter.push(bytes('\x1b[6;20;9tx'))
+    assert.equal(text(later.forward), '\x1b[6;20;9tx')
+    assert.deepEqual(later.consumed, [])
+    assert.deepEqual(later.reports.map((r) => r.kind), ['cell'])
+  })
+
+  it('consumes only the kinds still owed; a repeat of an answered kind goes to the child', () => {
+    const filter = new ReplyFilter(['cell'])
+    const r = filter.push(bytes('\x1b[4;760;1481t\x1b[6;20;9t\x1b[6;21;9t'))
+    assert.equal(text(r.forward), '\x1b[4;760;1481t\x1b[6;21;9t')
+    assert.deepEqual(r.consumed.map((x) => [x.kind, x.height]), [['cell', 20]])
+  })
+
+  it('holds the start of an owed report across chunks, and gives it back when it was not one', () => {
+    const filter = new ReplyFilter(['cell'])
+    const a = filter.push(bytes('ab\x1b[6;2'))
+    assert.equal(text(a.forward), 'ab')
+    assert.equal(filter.holding, true)
+    const b = filter.push(bytes('0;9tcd'))
+    assert.equal(text(b.forward), 'cd')
+    assert.deepEqual(b.consumed.map((x) => x.kind), ['cell'])
+    assert.equal(filter.holding, false)
+
+    const other = new ReplyFilter(['cell'])
+    assert.equal(text(other.push(bytes('x\x1b[6;5')).forward), 'x')
+    assert.equal(text(other.push(bytes('~y')).forward), '\x1b[6;5~y', 'Ctrl+PgDn split after its parameters')
+    other.push(bytes('\x1b[6;'))
+    assert.equal(text(other.flush()), '\x1b[6;')
+    assert.equal(other.holding, false)
+  })
+
+  it('never holds keys: a lone ESC, CSI 6 ~, or a report kind no longer owed', () => {
+    const filter = new ReplyFilter(['cell'])
+    for (const key of ['\x1b', '\x1b[', '\x1b[6', '\x1b[6~', '\x1b[4;5']) {
+      assert.equal(text(filter.push(bytes(key)).forward), key, JSON.stringify(key))
+      assert.equal(filter.holding, false, JSON.stringify(key))
+    }
+  })
+
+  it('passes everything through untouched when nothing is owed', () => {
+    const filter = new ReplyFilter([])
+    const chunk = bytes('\x1b[6;20;9t\x1b[6;2')
+    const r = filter.push(chunk)
+    assert.equal(r.forward, chunk)
+    assert.equal(r.reports.length, 1)
+    assert.equal(filter.holding, false)
+  })
 })
 
 describe('learnCellSize', () => {
@@ -147,7 +221,14 @@ describe('learnCellSize', () => {
     input.send('typed early')
     const r = await p
     assert.ok(Date.now() - started >= 70)
-    assert.deepEqual(r, { cell: { width: 7, height: 14 }, fromTerminal: false, source: 'fallback', reports: [], leftover: r.leftover })
+    assert.deepEqual(r, {
+      cell: { width: 7, height: 14 },
+      fromTerminal: false,
+      source: 'fallback',
+      reports: [],
+      missing: new Set(['text-area', 'cells', 'cell']),
+      leftover: r.leftover,
+    })
     assert.equal(Buffer.from(r.leftover).toString('latin1'), 'typed early')
     assert.equal(input.paused, true)
   })
@@ -183,5 +264,17 @@ describe('learnCellSize', () => {
     assert.ok(Date.now() - started < 1000)
     assert.deepEqual(r.cell, { width: 1481 / 158, height: 20 })
     assert.equal(r.source, 'text area')
+    assert.deepEqual(r.missing, new Set(['cells', 'cell']), 'the answers still owed, for the ReplyFilter')
+  })
+
+  it('keeps UTF-8 typed during the window intact, 0x9b bytes and all', async () => {
+    const input = new FakeInput()
+    const p = learnCellSize({ input, write: () => {}, timeoutMs: 50, screen: () => ({ columns: 80, rows: 24 }) })
+    const typed = 'ńŁ ść Û6;20;10t ok 💛4;1;1t'
+    input.emit('data', Buffer.from(typed, 'utf8'))
+    const r = await p
+    assert.equal(Buffer.from(r.leftover).toString('utf8'), typed)
+    assert.equal(r.source, 'fallback')
+    assert.equal(r.reports.length, 0)
   })
 })

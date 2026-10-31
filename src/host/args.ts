@@ -75,11 +75,21 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     args: [],
   }
   let i = 0
-  const value = (name: string, inline: string | undefined): string => {
+  let inline: string | undefined
+  /** The option's value: after `=`, else the next argument, which must not be another option. */
+  const value = (name: string): string => {
     if (inline !== undefined) return inline
     const next = argv[++i]
     if (next === undefined) throw new UsageError(`${name} needs a value`)
+    if (next.startsWith('--')) {
+      throw new UsageError(`${name} needs a value, got the option ${next} (write ${name}=${next} if that is the value)`)
+    }
     return next
+  }
+  /** A switch takes no value: `--no-files=false` would otherwise quietly mean `--no-files`. */
+  const flag = (name: string): true => {
+    if (inline !== undefined) throw new UsageError(`${name} takes no value, got "${name}=${inline}"`)
+    return true
   }
   for (; i < argv.length; i++) {
     const arg = argv[i] as string
@@ -90,24 +100,24 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     if (!arg.startsWith('-') || arg === '-') break
     const eq = arg.indexOf('=')
     const name = arg.startsWith('--') && eq > 0 ? arg.slice(0, eq) : arg
-    const inline = arg.startsWith('--') && eq > 0 ? arg.slice(eq + 1) : undefined
+    inline = arg.startsWith('--') && eq > 0 ? arg.slice(eq + 1) : undefined
     switch (name) {
       case '--cell': {
-        const raw = value(name, inline)
+        const raw = value(name)
         const cell = parseCellOption(raw)
         if (cell === undefined) throw new UsageError(`--cell expects WxH, e.g. 10x20, got "${raw}"`)
         options.cell = cell
         break
       }
       case '--debug':
-        options.debug = true
+        options.debug = flag(name)
         break
       case '--log':
-        options.logFile = value(name, inline)
+        options.logFile = value(name)
         options.debug = true
         break
       case '--scale': {
-        const raw = value(name, inline)
+        const raw = value(name)
         if (raw !== 'auto' && raw !== 'nearest' && raw !== 'smooth') {
           throw new UsageError(`--scale expects auto, nearest or smooth, got "${raw}"`)
         }
@@ -115,27 +125,27 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         break
       }
       case '--no-files':
-        options.files = false
+        options.files = !flag(name)
         break
       case '--no-force':
-        options.force = false
+        options.force = !flag(name)
         break
       case '--no-inherit-cursor':
-        options.inheritCursor = false
+        options.inheritCursor = !flag(name)
         break
       case '--help':
       case '-h':
-        options.help = true
+        options.help = flag(name)
         break
       case '--version':
       case '-V':
-        options.version = true
+        options.version = flag(name)
         break
       case '--wire':
-        options.wire = value(name, inline)
+        options.wire = value(name)
         break
       case '--vt-input': {
-        const raw = value(name, inline)
+        const raw = value(name)
         if (raw !== 'auto' && raw !== 'always' && raw !== 'never') {
           throw new UsageError(`--vt-input expects auto, always or never, got "${raw}"`)
         }

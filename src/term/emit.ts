@@ -14,13 +14,15 @@
 // same filter taps as scaling the whole box, see resizeRegion) and encoded,
 // so a ~30-byte `a=p,c=1000,r=1000` costs at most a screenful of sixel. The
 // cursor still moves past the whole box. Encoded placements are cached per
-// source image (the engine passes the same `Rgba` for every uncropped put of
-// an image) within a byte budget, so repeated puts are not re-encoded.
+// stored image (the engine passes the same `Rgba` for every put of an image,
+// with the source rectangle beside it rather than a crop) within a byte
+// budget, so repeated puts, cropped or not, are not re-encoded.
 //
 // encodePlaceholderStrip does the same for one strip of unicode placeholder
 // cells (see src/term/placeholders.ts).
 
 import type { CellSize, PlaceEmitter, Rgba, ScaleMode, ScreenSize, SixelOptions } from '../types.ts'
+import { cropRgba } from '../image/crop.ts'
 import { resizeRegion, resizeRgba } from '../image/resize.ts'
 import { encodeSixelBytes } from '../sixel/encode.ts'
 
@@ -149,10 +151,13 @@ function visibleCells(count: number, screen: number | undefined): number {
  * show there (`round(cells * cell size)`, within the capped box of
  * {@link placementGeometry}). The cursor still moves past the whole box.
  *
+ * `event.source`, when present, is the rectangle of `event.image` drawn; it
+ * is cut out only on a cache miss, and dropped once scaled.
+ *
  * Outputs are cached per `event.image` object (see {@link PlaceCache}) under
- * its box, cell size, visible cells and cursor policy, within
- * `opts.cacheBytes`; a hit returns the same `Uint8Array`, which callers must
- * not modify.
+ * the source rectangle, box, cell size, visible cells and cursor policy,
+ * within `opts.cacheBytes`; a hit returns the same `Uint8Array`, which
+ * callers must not modify.
  */
 export function createPlaceEmitter(opts: EmitOptions = {}): PlaceEmitter {
   const sixelOptions = sixelOptionsOf(opts)
@@ -162,17 +167,21 @@ export function createPlaceEmitter(opts: EmitOptions = {}): PlaceEmitter {
     const rows = Math.max(1, Math.round(event.rows))
     const shownColumns = visibleCells(columns, screen?.columns)
     const shownRows = visibleCells(rows, screen?.rows)
-    const key = `${columns},${rows},${cell.width},${cell.height},${shownColumns},${shownRows},${event.cursor}`
+    const source = event.source
+    const area = source === undefined ? '' : `,${source.x},${source.y},${source.width},${source.height}`
+    const key = `${columns},${rows},${cell.width},${cell.height},${shownColumns},${shownRows},${event.cursor}${area}`
     const cached = cache.get(event.image, key)
     if (cached !== undefined) return cached
+
+    const picture = source === undefined ? event.image : cropRgba(event.image, source.x, source.y, source.width, source.height)
 
     const box = placementGeometry(columns, rows, cell)
     const width = shownColumns < columns ? Math.min(box.width, Math.max(1, Math.round(shownColumns * cell.width))) : box.width
     const height = shownRows < rows ? Math.min(box.height, Math.max(1, Math.round(shownRows * cell.height))) : box.height
     const image =
       width === box.width && height === box.height
-        ? scaleToBox(event.image, columns, rows, cell, opts.scale)
-        : resizeRegion(event.image, box.width, box.height, width, height, { mode: opts.scale ?? 'auto' })
+        ? scaleToBox(picture, columns, rows, cell, opts.scale)
+        : resizeRegion(picture, box.width, box.height, width, height, { mode: opts.scale ?? 'auto' })
     const sixel = encodeSixelBytes(image, sixelOptions)
 
     let tail = String.fromCharCode(...RESTORE)

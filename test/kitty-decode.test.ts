@@ -29,6 +29,8 @@ describe('t=d error messages', () => {
     const limits = { maxImageBytes: 1024, maxPayloadBytes: 64 }
     await failsWith({ f: '32', s: '123', v: '456' }, b64(new Uint8Array(8)), limits, 'EFBIG')
     await failsWith({ f: '32', s: '1', v: '1' }, 'A'.repeat(100), limits, 'EFBIG')
-    await failsWith({ f: '32', s: '1', v: '1', o: 'z' }, b64(deflateSync(new Uint8Array(5000))), limits, 'EFBIG')
+    await failsWith({ f: '100', o: 'z' }, b64(deflateSync(new Uint8Array(5000))), limits, 'EFBIG')
+    // Raw data inflating past s*v*bpp is a mismatch, not a size limit (as in kitty).
+    await failsWith({ f: '32', s: '1', v: '1', o: 'z' }, b64(deflateSync(new Uint8Array(5000))), limits, 'EINVAL')
   })
 })
